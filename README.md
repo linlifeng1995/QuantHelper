@@ -72,6 +72,20 @@ web_app.py           旧版 Streamlit 应用
 - `outputs/cache/` 下的价格缓存、观察池和数据库文件属于本地运行数据，通常不应提交到 Git。
 - 回测结果和 AI 诊断用于研究与复核，不构成确定性买卖建议。
 
+## 腾讯云部署
+
+部署流程和服务器说明见 [项目设计文档：服务器部署](docs/项目设计文档.md#17-服务器部署)。
+
+关键部署文件：
+
+- [server-setup.sh](deploy/server-setup.sh)：腾讯云 Ubuntu 22.04 初始化，安装系统依赖、Node.js、Nginx，并创建应用用户和目录。
+- [upload.ps1](deploy/upload.ps1)：从 Windows 本地打包并上传项目到云服务器。
+- [server-setup-2.sh](deploy/server-setup-2.sh)：上传后在服务器执行，安装 Python 依赖、构建前端、配置 `.env`、systemd 和 Nginx。
+- [nginx.conf](deploy/nginx.conf)：Nginx 反向代理配置。
+- [myquant-backend.service](deploy/myquant-backend.service)：FastAPI 后端 systemd 服务。
+- [myquant-frontend.service](deploy/myquant-frontend.service)：Next.js 前端 systemd 服务。
+- [requirements-deploy.txt](deploy/requirements-deploy.txt)：云服务器 Python 依赖清单。
+
 ## 更多文档
 
 - [Web 应用详细说明](WEB_APP_README.md)
