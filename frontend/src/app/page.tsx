@@ -11,8 +11,11 @@ import {
   InputNumber,
   Layout,
   Menu,
+  message,
   Modal,
+  Popconfirm,
   Progress,
+  Radio,
   Row,
   Col,
   Select,
@@ -27,23 +30,51 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
+  AppstoreOutlined,
+  BulbOutlined,
   DashboardOutlined,
   DatabaseOutlined,
   DeleteOutlined,
   ExperimentOutlined,
   FundProjectionScreenOutlined,
+  GoldOutlined,
+  MenuOutlined,
+  MessageOutlined,
   PlusOutlined,
   ReloadOutlined,
+  SafetyOutlined,
   StockOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import PoolsPanel from "./components/PoolsPanel";
+import PlansPanel from "./components/PlansPanel";
+import RecommendPanel from "./components/RecommendPanel";
+import FactorsPanel from "./components/FactorsPanel";
+import RiskPanel from "./components/RiskPanel";
+import ScenarioPanel from "./components/ScenarioPanel";
+import SnapshotsPanel from "./components/SnapshotsPanel";
+import RollingBacktestPanel from "./components/RollingBacktestPanel";
+import TaskStatusBar from "./components/TaskStatusBar";
+import AgentAssistantDrawer, { type AgentDraft } from "./components/AgentAssistantDrawer";
+import { TickerCell, registerTickerNames } from "./components/TickerCell";
+import StockNewsCard from "./components/StockNewsCard";
+import packageJson from "../../package.json";
+import {
+  loadWatchlist,
+  addToWatchlist as addToWatchlistStorage,
+  removeFromWatchlist as removeFromWatchlistStorage,
+  clearWatchlist,
+} from "./lib/watchlist-storage";
 
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+const API_BASE_LABEL = API_BASE || "/api";
+const APP_VERSION = packageJson.version;
 
-type SectionKey = "dashboard" | "update" | "screen" | "backtest";
+type SectionKey = "dashboard" | "recommend" | "update" | "screen" | "backtest" | "pools" | "plans" | "factors" | "risk";
 
 type CacheSummary = {
   cache: {
@@ -100,6 +131,10 @@ type CacheSummary = {
   pool_count: number;
   price_symbol_count: number;
   price_row_count: number;
+  cache_paths?: {
+    price_cache_file?: string;
+    pool_cache_file?: string;
+  };
 };
 
 type FactorTemplate = {
@@ -176,19 +211,43 @@ type ScreenRow = {
 };
 
 type UpdateAction = "sync_latest" | "repair_price" | "refresh_fundamentals" | "rebuild_price";
+type UpdateSpeedProfile = "fast" | "balanced" | "stable";
 
 type UpdateTask = {
   id: string;
   action: UpdateAction;
-  status: "queued" | "running" | "succeeded" | "failed";
+  status: "queued" | "running" | "cancelling" | "cancelled" | "succeeded" | "failed";
   progress: number;
   chunk_progress: number;
   message: string;
   result?: {
     stats?: Record<string, number>;
     cache_range?: string[];
+    post_check?: {
+      price_ok: boolean;
+      missing_count: number;
+      stale_count: number;
+      price_has_gaps: boolean;
+      cache_range?: string[];
+      pool_count?: number;
+      price_symbol_count?: number;
+      price_row_count?: number;
+      missing_tickers?: string[];
+      stale_tickers?: string[];
+      issues?: string[];
+      price_cache_file?: string;
+      pool_cache_file?: string;
+    };
   } | null;
   error?: string | null;
+  warning?: string | null;
+  download_stats?: {
+    total_tickers?: number;
+    processed_tickers?: number;
+    tickers_updated?: number;
+    tickers_skipped?: number;
+    tickers_failed?: number;
+  };
   created_at?: string;
   updated_at?: string;
   started_at?: string;
@@ -217,6 +276,33 @@ const updateActionLabels: Record<UpdateAction, string> = {
   repair_price: "补齐缺失/落后的行情",
   refresh_fundamentals: "更新财务与估值数据",
   rebuild_price: "重新下载全部历史行情",
+};
+
+const updateSpeedProfiles: Record<
+  UpdateSpeedProfile,
+  { label: string; tsMinIntervalSec: number; batchTradeDateMaxDays: number; batchTickerChunkSize: number; batchMinTickers: number }
+> = {
+  fast: {
+    label: "快速模式（更激进）",
+    tsMinIntervalSec: 0,
+    batchTradeDateMaxDays: 7,
+    batchTickerChunkSize: 600,
+    batchMinTickers: 1,
+  },
+  balanced: {
+    label: "均衡模式（推荐）",
+    tsMinIntervalSec: 0.15,
+    batchTradeDateMaxDays: 7,
+    batchTickerChunkSize: 200,
+    batchMinTickers: 10,
+  },
+  stable: {
+    label: "稳健模式（保守）",
+    tsMinIntervalSec: 0.6,
+    batchTradeDateMaxDays: 3,
+    batchTickerChunkSize: 120,
+    batchMinTickers: 30,
+  },
 };
 
 const actionMeta: Record<UpdateAction, { when: string; updates: string; overwrite: string; duration: string; risk: "低" | "中" | "高" }> = {
@@ -317,14 +403,31 @@ function splitReasonAndRisk(value?: string) {
   return { reasons, risks };
 }
 
+function humanizeError(exc: unknown, fallback = "加载失败") {
+  const message = exc instanceof Error ? exc.message : String(exc ?? "");
+  const lower = message.toLowerCase();
+  if (lower.includes("failed to fetch") || lower.includes("networkerror")) {
+    return `连接后端失败，请确认 API 服务已启动（${API_BASE_LABEL}）。`;
+  }
+  if (lower.includes("timeout")) {
+    return "后端响应超时，请稍后重试。";
+  }
+  return message || fallback;
+}
+
 export default function Home() {
   const [activeSection, setActiveSection] = useState<SectionKey>("dashboard");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [summary, setSummary] = useState<CacheSummary | null>(null);
   const [templates, setTemplates] = useState<Record<string, FactorTemplate>>({});
   const [selectedTemplate, setSelectedTemplate] = useState("稳健质量股");
   const [topN, setTopN] = useState(30);
   const [industryOptions, setIndustryOptions] = useState<IndustryOption[]>([]);
   const [selectedIndustries, setSelectedIndustries] = useState<string[]>([]);
+  const [conceptOptions, setConceptOptions] = useState<{ ts_code: string; name: string; count: number }[]>([]);
+  const [selectedConcepts, setSelectedConcepts] = useState<string[]>([]);
+  const [conceptsLoading, setConceptsLoading] = useState(false);
+  const [filterMode, setFilterMode] = useState<"all" | "industry" | "concept">("all");
   const [industryNeutral, setIndustryNeutral] = useState(true);
   const [allowIncomplete, setAllowIncomplete] = useState(false);
   const [weights, setWeights] = useState<Record<string, number>>({});
@@ -334,9 +437,14 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [updateToken, setUpdateToken] = useState("");
-  const [updateHttpUrl, setUpdateHttpUrl] = useState("http://teajoin.com");
+  const [updateHttpUrl, setUpdateHttpUrl] = useState("http://111.170.140.159:8020/");
   const [updateStartDate, setUpdateStartDate] = useState("2025-06-01");
   const [downloadWorkers, setDownloadWorkers] = useState(2);
+  const [updateSpeedProfile, setUpdateSpeedProfile] = useState<UpdateSpeedProfile>("balanced");
+  const [tsMinIntervalSec, setTsMinIntervalSec] = useState(0.15);
+  const [batchTradeDateMaxDays, setBatchTradeDateMaxDays] = useState(7);
+  const [batchTickerChunkSize, setBatchTickerChunkSize] = useState(200);
+  const [batchMinTickers, setBatchMinTickers] = useState(10);
   const [includeStaleTickers, setIncludeStaleTickers] = useState(true);
   const [updateTask, setUpdateTask] = useState<UpdateTask | null>(null);
   const [taskHistory, setTaskHistory] = useState<UpdateTask[]>([]);
@@ -368,11 +476,19 @@ export default function Home() {
   const [selectedStrategies, setSelectedStrategies] = useState<string[]>(["双均线趋势"]);
   const [backtestLoading, setBacktestLoading] = useState(false);
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [agentDraft, setAgentDraft] = useState<AgentDraft | null>(null);
+  const pollStableRoundsRef = useRef(0);
+  const pollLastProgressRef = useRef<number>(-1);
 
   const templateOptions = useMemo(() => Object.keys(templates), [templates]);
   const industrySelectOptions = useMemo(
     () => industryOptions.map((item) => ({ value: item.name, label: `${item.name} (${item.count})` })),
     [industryOptions],
+  );
+  const conceptSelectOptions = useMemo(
+    () => conceptOptions.map((item) => ({ value: item.ts_code, label: `${item.name} (${item.count})` })),
+    [conceptOptions],
   );
   const strategyOptions = useMemo(
     () => Object.entries(availableStrategies).map(([value, meta]) => ({ value, label: `${value} · ${meta.category}` })),
@@ -382,37 +498,72 @@ export default function Home() {
   const loadDashboard = useCallback(async () => {
     setError("");
     try {
-      const [summaryRes, templateRes, historyRes, watchlistRes, industriesRes, strategiesRes] = await Promise.all([
-        fetch(`${API_BASE}/api/cache/summary`, { cache: "no-store" }),
-        fetch(`${API_BASE}/api/factor/templates`, { cache: "no-store" }),
-        fetch(`${API_BASE}/api/tasks/history?limit=8`, { cache: "no-store" }),
-        fetch(`${API_BASE}/api/watchlist`, { cache: "no-store" }),
-        fetch(`${API_BASE}/api/pool/industries`, { cache: "no-store" }),
-        fetch(`${API_BASE}/api/backtest/strategies`, { cache: "no-store" }),
-      ]);
-      if (!summaryRes.ok || !templateRes.ok || !historyRes.ok || !watchlistRes.ok || !industriesRes.ok || !strategiesRes.ok) {
-        throw new Error("无法连接 MyQuant API");
+      const summaryRes = await fetch(`${API_BASE}/api/cache/summary`, { cache: "no-store" });
+      if (!summaryRes.ok) {
+        throw new Error("诊断接口不可用");
       }
       const summaryJson = (await summaryRes.json()) as CacheSummary;
-      const templateJson = (await templateRes.json()) as { templates: Record<string, FactorTemplate> };
-      const historyJson = (await historyRes.json()) as { tasks: UpdateTask[] };
-      const watchlistJson = (await watchlistRes.json()) as { rows: ScreenRow[] };
-      const industriesJson = (await industriesRes.json()) as { industries: IndustryOption[] };
-      const strategiesJson = (await strategiesRes.json()) as { strategies: Record<string, BacktestStrategyMeta> };
       setSummary(summaryJson);
-      setTemplates(templateJson.templates);
-      setTaskHistory(historyJson.tasks ?? []);
-      setWatchlist(watchlistJson.rows ?? []);
-      setIndustryOptions(industriesJson.industries ?? []);
-      setAvailableStrategies(strategiesJson.strategies ?? {});
-      const firstTemplate = templateJson.templates[selectedTemplate] ? selectedTemplate : Object.keys(templateJson.templates)[0];
-      if (firstTemplate) {
-        setSelectedTemplate(firstTemplate);
-        setWeights(templateJson.templates[firstTemplate].weights);
-        setFilters(templateJson.templates[firstTemplate].filters);
+
+      const [templateRes, historyRes, industriesRes, strategiesRes, recommendRes] = await Promise.allSettled([
+        fetch(`${API_BASE}/api/factor/templates`, { cache: "no-store" }),
+        fetch(`${API_BASE}/api/tasks/history?limit=8`, { cache: "no-store" }),
+        fetch(`${API_BASE}/api/pool/industries`, { cache: "no-store" }),
+        fetch(`${API_BASE}/api/backtest/strategies`, { cache: "no-store" }),
+        fetch(`${API_BASE}/api/recommend`, { cache: "no-store" }),
+      ]);
+
+      // 观察列表从 localStorage 读取（每个浏览器用户独立）
+      setWatchlist(loadWatchlist() as unknown as ScreenRow[]);
+
+      if (templateRes.status === "fulfilled" && templateRes.value.ok) {
+        const templateJson = (await templateRes.value.json()) as { templates: Record<string, FactorTemplate> };
+        setTemplates(templateJson.templates);
+        const firstTemplate = templateJson.templates[selectedTemplate] ? selectedTemplate : Object.keys(templateJson.templates)[0];
+        if (firstTemplate) {
+          setSelectedTemplate(firstTemplate);
+          setWeights(templateJson.templates[firstTemplate].weights);
+          setFilters(templateJson.templates[firstTemplate].filters);
+        }
+      }
+
+      if (historyRes.status === "fulfilled" && historyRes.value.ok) {
+        const historyJson = (await historyRes.value.json()) as { tasks: UpdateTask[] };
+        setTaskHistory(historyJson.tasks ?? []);
+      }
+
+      if (industriesRes.status === "fulfilled" && industriesRes.value.ok) {
+        const industriesJson = (await industriesRes.value.json()) as { industries: IndustryOption[] };
+        setIndustryOptions(industriesJson.industries ?? []);
+      }
+
+      if (strategiesRes.status === "fulfilled" && strategiesRes.value.ok) {
+        const strategiesJson = (await strategiesRes.value.json()) as { strategies: Record<string, BacktestStrategyMeta> };
+        setAvailableStrategies(strategiesJson.strategies ?? {});
+      }
+
+      if (recommendRes.status === "fulfilled" && recommendRes.value.ok) {
+        const recommendJson = (await recommendRes.value.json()) as { groups?: Array<{ items?: ScreenRow[] }> };
+        const recommendRows = (recommendJson.groups ?? []).flatMap((group) => group.items ?? []);
+        registerTickerNames(recommendRows);
+      }
+
+      try {
+        const runningRes = await fetch(`${API_BASE}/api/tasks/running`, { cache: "no-store" });
+        if (runningRes.ok) {
+          const runningJson = (await runningRes.json()) as { task: UpdateTask | null };
+          setUpdateTask((current) => {
+            if (current && ["queued", "running", "cancelling"].includes(current.status)) {
+              return current;
+            }
+            return runningJson.task ?? current;
+          });
+        }
+      } catch {
+        // ignore running task probe failures
       }
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "加载失败");
+      setError(humanizeError(exc, "加载失败"));
     }
   }, [selectedTemplate]);
 
@@ -421,41 +572,79 @@ export default function Home() {
 
     async function initDashboard() {
       try {
-        const [summaryRes, templateRes, historyRes, watchlistRes, industriesRes, strategiesRes] = await Promise.all([
-          fetch(`${API_BASE}/api/cache/summary`, { cache: "no-store" }),
-          fetch(`${API_BASE}/api/factor/templates`, { cache: "no-store" }),
-          fetch(`${API_BASE}/api/tasks/history?limit=8`, { cache: "no-store" }),
-          fetch(`${API_BASE}/api/watchlist`, { cache: "no-store" }),
-          fetch(`${API_BASE}/api/pool/industries`, { cache: "no-store" }),
-          fetch(`${API_BASE}/api/backtest/strategies`, { cache: "no-store" }),
-        ]);
-        if (!summaryRes.ok || !templateRes.ok || !historyRes.ok || !watchlistRes.ok || !industriesRes.ok || !strategiesRes.ok) {
-          throw new Error("无法连接 MyQuant API");
+        const summaryRes = await fetch(`${API_BASE}/api/cache/summary`, { cache: "no-store" });
+        if (!summaryRes.ok) {
+          throw new Error("诊断接口不可用");
         }
         const summaryJson = (await summaryRes.json()) as CacheSummary;
-        const templateJson = (await templateRes.json()) as { templates: Record<string, FactorTemplate> };
-        const historyJson = (await historyRes.json()) as { tasks: UpdateTask[] };
-        const watchlistJson = (await watchlistRes.json()) as { rows: ScreenRow[] };
-        const industriesJson = (await industriesRes.json()) as { industries: IndustryOption[] };
-        const strategiesJson = (await strategiesRes.json()) as { strategies: Record<string, BacktestStrategyMeta> };
         if (cancelled) {
           return;
         }
         setSummary(summaryJson);
-        setTemplates(templateJson.templates);
-        setTaskHistory(historyJson.tasks ?? []);
-        setWatchlist(watchlistJson.rows ?? []);
-        setIndustryOptions(industriesJson.industries ?? []);
-        setAvailableStrategies(strategiesJson.strategies ?? {});
-        const firstTemplate = templateJson.templates["稳健质量股"] ? "稳健质量股" : templateJson.templates["趋势质量股"] ? "趋势质量股" : Object.keys(templateJson.templates)[0];
-        if (firstTemplate) {
-          setSelectedTemplate(firstTemplate);
-          setWeights(templateJson.templates[firstTemplate].weights);
-          setFilters(templateJson.templates[firstTemplate].filters);
+
+        const [templateRes, historyRes, industriesRes, strategiesRes, recommendRes] = await Promise.allSettled([
+          fetch(`${API_BASE}/api/factor/templates`, { cache: "no-store" }),
+          fetch(`${API_BASE}/api/tasks/history?limit=8`, { cache: "no-store" }),
+          fetch(`${API_BASE}/api/pool/industries`, { cache: "no-store" }),
+          fetch(`${API_BASE}/api/backtest/strategies`, { cache: "no-store" }),
+          fetch(`${API_BASE}/api/recommend`, { cache: "no-store" }),
+        ]);
+
+        // 观察列表从 localStorage 读取（每个浏览器用户独立）
+        if (!cancelled) {
+          const localWatchlist = loadWatchlist() as unknown as ScreenRow[];
+          setWatchlist(localWatchlist);
+          registerTickerNames(localWatchlist);
+        }
+
+        if (templateRes.status === "fulfilled" && templateRes.value.ok) {
+          const templateJson = (await templateRes.value.json()) as { templates: Record<string, FactorTemplate> };
+          if (!cancelled) {
+            setTemplates(templateJson.templates);
+            const firstTemplate = templateJson.templates["稳健质量股"] ? "稳健质量股" : templateJson.templates["趋势质量股"] ? "趋势质量股" : Object.keys(templateJson.templates)[0];
+            if (firstTemplate) {
+              setSelectedTemplate(firstTemplate);
+              setWeights(templateJson.templates[firstTemplate].weights);
+              setFilters(templateJson.templates[firstTemplate].filters);
+            }
+          }
+        }
+
+        if (historyRes.status === "fulfilled" && historyRes.value.ok && !cancelled) {
+          const historyJson = (await historyRes.value.json()) as { tasks: UpdateTask[] };
+          setTaskHistory(historyJson.tasks ?? []);
+        }
+
+        if (industriesRes.status === "fulfilled" && industriesRes.value.ok && !cancelled) {
+          const industriesJson = (await industriesRes.value.json()) as { industries: IndustryOption[] };
+          setIndustryOptions(industriesJson.industries ?? []);
+        }
+
+        if (strategiesRes.status === "fulfilled" && strategiesRes.value.ok && !cancelled) {
+          const strategiesJson = (await strategiesRes.value.json()) as { strategies: Record<string, BacktestStrategyMeta> };
+          setAvailableStrategies(strategiesJson.strategies ?? {});
+        }
+
+        if (recommendRes.status === "fulfilled" && recommendRes.value.ok && !cancelled) {
+          const recommendJson = (await recommendRes.value.json()) as { groups?: Array<{ items?: ScreenRow[] }> };
+          const recommendRows = (recommendJson.groups ?? []).flatMap((group) => group.items ?? []);
+          registerTickerNames(recommendRows);
+        }
+
+        try {
+          const runningRes = await fetch(`${API_BASE}/api/tasks/running`, { cache: "no-store" });
+          if (runningRes.ok && !cancelled) {
+            const runningJson = (await runningRes.json()) as { task: UpdateTask | null };
+            if (runningJson.task) {
+              setUpdateTask(runningJson.task);
+            }
+          }
+        } catch {
+          // ignore
         }
       } catch (exc) {
         if (!cancelled) {
-          setError(exc instanceof Error ? exc.message : "加载失败");
+          setError(humanizeError(exc, "加载失败"));
         }
       }
     }
@@ -475,6 +664,15 @@ export default function Home() {
     }
   }
 
+  function applyUpdateSpeedProfile(profile: UpdateSpeedProfile) {
+    setUpdateSpeedProfile(profile);
+    const cfg = updateSpeedProfiles[profile];
+    setTsMinIntervalSec(cfg.tsMinIntervalSec);
+    setBatchTradeDateMaxDays(cfg.batchTradeDateMaxDays);
+    setBatchTickerChunkSize(cfg.batchTickerChunkSize);
+    setBatchMinTickers(cfg.batchMinTickers);
+  }
+
   async function runScreen() {
     if (diagnostic && !diagnostic.can_screen) {
       setError("当前数据不适合筛选，请先到数据更新页处理。 ");
@@ -489,7 +687,8 @@ export default function Home() {
         body: JSON.stringify({
           template_name: selectedTemplate,
           top_n: topN,
-          industries: selectedIndustries,
+          industries: filterMode === "industry" ? selectedIndustries : [],
+          concept_codes: filterMode === "concept" ? selectedConcepts : [],
           weights,
           filters,
           industry_neutral: industryNeutral,
@@ -502,6 +701,7 @@ export default function Home() {
         throw new Error(typeof detail === "string" ? detail : detail?.message ?? "筛选失败");
       }
       setRows(payload.rows ?? []);
+      registerTickerNames(payload.rows ?? []);
       setRemoved(payload.removed ?? {});
       await loadDashboard();
     } catch (exc) {
@@ -511,42 +711,20 @@ export default function Home() {
     }
   }
 
-  async function addToWatchlist(row: ScreenRow) {
-    setWatchlistLoading(true);
-    setError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/watchlist`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(row),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(typeof payload?.detail === "string" ? payload.detail : "加入观察池失败");
-      }
-      setWatchlist(payload.rows ?? []);
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "加入观察池失败");
-    } finally {
-      setWatchlistLoading(false);
-    }
+  function addToWatchlist(row: ScreenRow) {
+    const rows = addToWatchlistStorage({
+      ticker: row.ticker,
+      name: (row as Record<string, unknown>)["名称"] as string | undefined ?? undefined,
+      industry: (row as Record<string, unknown>)["行业"] as string | undefined ?? undefined,
+    });
+    setWatchlist(rows as unknown as ScreenRow[]);
+    void message.success(`已加入观察池`);
   }
 
-  async function removeFromWatchlist(ticker: string) {
-    setWatchlistLoading(true);
-    setError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/watchlist/${encodeURIComponent(ticker)}`, { method: "DELETE" });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(typeof payload?.detail === "string" ? payload.detail : "移出观察池失败");
-      }
-      setWatchlist(payload.rows ?? []);
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "移出观察池失败");
-    } finally {
-      setWatchlistLoading(false);
-    }
+  function removeFromWatchlist(ticker: string) {
+    const rows = removeFromWatchlistStorage(ticker);
+    setWatchlist(rows as unknown as ScreenRow[]);
+    void message.success(`已移出观察池`);
   }
 
   function handleRowsForBacktest(source: "screen" | "watchlist" = "screen") {
@@ -627,12 +805,32 @@ export default function Home() {
           http_url: updateHttpUrl,
           start_date: updateStartDate,
           download_workers: downloadWorkers,
+          ts_min_interval_sec: tsMinIntervalSec,
+          batch_trade_date_max_days: batchTradeDateMaxDays,
+          batch_ticker_chunk_size: batchTickerChunkSize,
+          batch_min_tickers: batchMinTickers,
           include_stale_tickers: includeStaleTickers,
         }),
       });
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(typeof payload?.detail === "string" ? payload.detail : "启动任务失败");
+        const detailRaw = payload?.detail;
+        const detail = typeof detailRaw === "string" ? detailRaw : "启动任务失败";
+        if (response.status === 409 && detail.includes("已有数据更新任务正在执行")) {
+          try {
+            const runningRes = await fetch(`${API_BASE}/api/tasks/running`, { cache: "no-store" });
+            if (runningRes.ok) {
+              const runningJson = (await runningRes.json()) as { task: UpdateTask | null };
+              if (runningJson.task) {
+                setUpdateTask(runningJson.task);
+                setActiveSection("update");
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+        throw new Error(detail);
       }
       setUpdateTask(payload);
       setActiveSection("update");
@@ -643,13 +841,40 @@ export default function Home() {
     }
   }
 
+  async function cancelUpdateTask() {
+    if (!updateTask?.id) {
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE}/api/tasks/${updateTask.id}/cancel`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(typeof payload?.detail === "string" ? payload.detail : "取消任务失败");
+      }
+      setUpdateTask(payload as UpdateTask);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "取消任务失败");
+    }
+  }
+
   useEffect(() => {
-    if (!updateTask?.id || !["queued", "running"].includes(updateTask.status)) {
+    if (!updateTask?.id || !["queued", "running", "cancelling"].includes(updateTask.status)) {
       return;
     }
 
     let cancelled = false;
-    const timer = window.setInterval(async () => {
+    pollStableRoundsRef.current = 0;
+    pollLastProgressRef.current = -1;
+
+    let timer: number | undefined;
+    const scheduleNext = (delayMs: number) => {
+      if (cancelled) return;
+      timer = window.setTimeout(() => {
+        void pollTask();
+      }, delayMs);
+    };
+
+    const pollTask = async () => {
       try {
         const response = await fetch(`${API_BASE}/api/tasks/${updateTask.id}`, { cache: "no-store" });
         if (response.status === 404) {
@@ -668,26 +893,45 @@ export default function Home() {
         }
         const payload = (await response.json()) as UpdateTask;
         if (!cancelled) {
+          const progress = Number(payload.progress ?? 0);
+          const hasProgress = progress > pollLastProgressRef.current + 1e-6;
+          pollLastProgressRef.current = progress;
+          pollStableRoundsRef.current = hasProgress ? 0 : pollStableRoundsRef.current + 1;
+
           setUpdateTask(payload);
-          if (["succeeded", "failed"].includes(payload.status)) {
+          if (["succeeded", "failed", "cancelled"].includes(payload.status)) {
             void loadDashboard();
+            return;
           }
+
+          let nextDelay = 1200;
+          if (payload.status === "queued") {
+            nextDelay = Math.min(7000, 1800 + pollStableRoundsRef.current * 600);
+          } else if (payload.status === "cancelling") {
+            nextDelay = 800;
+          } else {
+            nextDelay = hasProgress ? 900 : Math.min(5000, 1400 + pollStableRoundsRef.current * 450);
+          }
+          scheduleNext(nextDelay);
         }
       } catch (exc) {
-        if (!cancelled) {
-          setError(exc instanceof Error ? exc.message : "查询任务状态失败");
-        }
+        // Ignore transient polling errors to avoid noisy global alerts.
+        scheduleNext(2500);
       }
-    }, 1200);
+    };
+
+    void pollTask();
 
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
     };
   }, [loadDashboard, updateTask?.id, updateTask?.status]);
 
   const columns: ColumnsType<ScreenRow> = [
-    { title: "代码", dataIndex: "ticker", width: 110 },
+    { title: "股票", dataIndex: "ticker", width: 150, render: (value: string, row) => <TickerCell ticker={value} name={row.名称} layout="stack" /> },
     { title: "名称", dataIndex: "名称", width: 110 },
     { title: "行业", dataIndex: "行业", width: 130 },
     {
@@ -735,11 +979,20 @@ export default function Home() {
     },
     {
       title: "操作",
-      width: 180,
+      width: 280,
       render: (_, row) => (
         <Space>
           <Button size="small" onClick={() => setSelectedStock(row)}>查看详情</Button>
-          <Button size="small" icon={<PlusOutlined />} loading={watchlistLoading} onClick={() => void addToWatchlist(row)} disabled={watchlist.some((item) => item.ticker === row.ticker)}>加入观察池</Button>
+          <Button
+            size="small"
+            icon={<MessageOutlined />}
+            onClick={() => openAgent({
+              scene: "stock_diagnosis",
+              userInput: `请对 ${row.ticker} 做交易前诊断，并给出三条可执行跟踪动作`,
+              payload: { ticker: row.ticker, selected_stock: row },
+            })}
+          >Agent诊断</Button>
+          <Button size="small" icon={<PlusOutlined />} onClick={() => addToWatchlist(row)} disabled={watchlist.some((item) => item.ticker === row.ticker)}>加入观察池</Button>
         </Space>
       ),
     },
@@ -753,14 +1006,36 @@ export default function Home() {
   const recommendedAction = diagnostic?.recommended_action ?? null;
   const statusColor = diagnostic?.usage_status === "live" ? "green" : diagnostic?.usage_status === "research" ? "gold" : "red";
   const canScreenText = diagnostic?.usage_label ?? (diagnostic?.can_screen ? "可用于选股" : "选股前建议处理");
-  const pageTitle = activeSection === "dashboard" ? "数据概览" : activeSection === "update" ? "数据更新" : activeSection === "screen" ? "多因子选股" : "策略回测";
+  const taskPostCheck = updateTask?.result?.post_check;
+  const taskPostCheckText = taskPostCheck
+    ? `复检${taskPostCheck.price_has_gaps ? `仍有行情缺口：缺失 ${taskPostCheck.missing_count} 只，落后 ${taskPostCheck.stale_count} 只` : "通过：行情缺失 0 只，落后 0 只"}`
+    : `当前数据${summary?.diagnostic?.can_screen ? "可用于选股" : "仍建议检查异常明细"}`;
+  const pageTitle = activeSection === "dashboard" ? "数据概览"
+    : activeSection === "recommend" ? "推荐关注"
+    : activeSection === "update" ? "数据更新"
+    : activeSection === "screen" ? "多因子选股"
+    : activeSection === "backtest" ? "策略回测"
+    : activeSection === "pools" ? "股票池管理"
+    : activeSection === "plans" ? "交易计划"
+    : activeSection === "factors" ? "因子注册表"
+    : "风控设置";
   const pageSubtitle = activeSection === "dashboard"
     ? "诊断当前数据是否可信，并给出下一步推荐操作。"
-    : activeSection === "update"
-      ? "根据概览诊断执行对应修复动作。"
-      : activeSection === "screen"
-        ? "调整风险过滤和因子权重，调用 FastAPI 执行真实筛选。"
-        : "使用筛选结果或观察池，基于本地价格缓存验证策略表现。";
+    : activeSection === "recommend"
+      ? "根据择时状态把候选标的归类为 5 组，并可一键生成交易计划。"
+      : activeSection === "update"
+        ? "根据概览诊断执行对应修复动作。"
+        : activeSection === "screen"
+          ? "调整风险过滤和因子权重，调用 FastAPI 执行真实筛选。"
+          : activeSection === "backtest"
+            ? "使用筛选结果或观察池，基于本地价格缓存验证策略表现。"
+            : activeSection === "pools"
+              ? "维护多个股票池（短线 / 中线 / 价值 / 高股息等），并跟踪每只标的的入选评分与最新评分。"
+              : activeSection === "plans"
+                ? "查看并管理交易计划：进场区间、止损止盈、仓位与状态。"
+                : activeSection === "factors"
+                  ? "按桶查看选股因子的方向、参与状态与数据可用性；事件类因子默认仅展示不进入评分。"
+                  : "配置账户级风控参数（单笔亏损、单只 / 行业仓位上限、市场状态仓位上限）；只影响未来交易计划。";
   const templateDescription = templateDescriptions[selectedTemplate] ?? "当前模板会按风险过滤和多因子权重生成候选观察名单。";
   const removedTotal = Object.values(removed).reduce((total, value) => total + Number(value || 0), 0);
   const afterFilterCount = Math.max(0, (summary?.pool_count ?? 0) - removedTotal);
@@ -801,7 +1076,7 @@ export default function Home() {
     { title: "卖出信号", dataIndex: "卖出信号数", render: (value) => numberText(value, 0) },
   ];
   const adviceColumns: ColumnsType<TradeAdvice> = [
-    { title: "代码", dataIndex: "ticker", width: 110 },
+    { title: "股票", dataIndex: "ticker", width: 180, render: (value: string) => <TickerCell ticker={value} layout="stack" /> },
     { title: "策略", dataIndex: "strategy", width: 150 },
     { title: "状态", dataIndex: "status", width: 110, render: (value, row) => <Tag color={row.risk_level === "高" ? "red" : row.risk_level === "中" ? "gold" : "green"}>{value}</Tag> },
     { title: "现价", dataIndex: "last_price", width: 100, render: (value) => numberText(value, 2) },
@@ -812,20 +1087,20 @@ export default function Home() {
   ];
   const signalColumns: ColumnsType<TradeSignal> = [
     { title: "日期", dataIndex: "date", width: 110 },
-    { title: "代码", dataIndex: "ticker", width: 110 },
+    { title: "股票", dataIndex: "ticker", width: 180, render: (value: string) => <TickerCell ticker={value} layout="stack" /> },
     { title: "策略", dataIndex: "strategy", width: 150 },
     { title: "动作", dataIndex: "action_text", width: 90, render: (value, row) => <Tag color={row.action === "buy" ? "green" : "red"}>{value}</Tag> },
     { title: "价格", dataIndex: "price", width: 100, render: (value) => numberText(value, 2) },
     { title: "触发原因", dataIndex: "reason", width: 360 },
   ];
   const backtestPoolColumns: ColumnsType<ScreenRow> = [
-    { title: "代码", dataIndex: "ticker" },
+    { title: "股票", dataIndex: "ticker", render: (value: string, row) => <TickerCell ticker={value} name={row.名称} layout="stack" /> },
     { title: "名称", dataIndex: "名称" },
     { title: "行业", dataIndex: "行业" },
     { title: "综合评分", dataIndex: "综合评分", render: (value) => numberText(value) },
   ];
   const watchlistColumns: ColumnsType<ScreenRow> = [
-    { title: "代码", dataIndex: "ticker", width: 120 },
+    { title: "股票", dataIndex: "ticker", width: 160, render: (value: string, row) => <TickerCell ticker={value} name={row.名称} layout="stack" /> },
     { title: "名称", dataIndex: "名称", width: 120, render: (value, row) => value ?? row.ticker },
     { title: "行业", dataIndex: "行业", width: 120, render: (value) => value ?? "-" },
     { title: "加入时评分", dataIndex: "综合评分", width: 110, render: (value) => numberText(value) },
@@ -866,11 +1141,20 @@ export default function Home() {
     { title: "加入时间", dataIndex: "added_at", width: 180, render: (value) => value ?? "-" },
     {
       title: "操作",
-      width: 150,
+      width: 260,
       render: (_, row) => (
         <Space>
           <Button size="small" onClick={() => setSelectedStock(row)}>查看详情</Button>
-          <Button size="small" danger icon={<DeleteOutlined />} loading={watchlistLoading} onClick={() => void removeFromWatchlist(row.ticker)}>移出</Button>
+          <Button
+            size="small"
+            icon={<MessageOutlined />}
+            onClick={() => openAgent({
+              scene: "stock_diagnosis",
+              userInput: `请对 ${row.ticker} 做交易前诊断，并给出三条可执行跟踪动作`,
+              payload: { ticker: row.ticker, selected_stock: row },
+            })}
+          >Agent诊断</Button>
+          <Button size="small" danger icon={<DeleteOutlined />} onClick={() => removeFromWatchlist(row.ticker)}>移出</Button>
         </Space>
       ),
     },
@@ -906,24 +1190,56 @@ export default function Home() {
     });
   }
 
+  function openAgent(draft: AgentDraft) {
+    setAgentDraft(draft);
+    setAgentOpen(true);
+  }
+
+  const navItems = [
+    { key: "dashboard", icon: <DashboardOutlined />, label: "数据概览" },
+    { key: "recommend", icon: <BulbOutlined />, label: "推荐关注" },
+    { key: "update", icon: <DatabaseOutlined />, label: "数据更新" },
+    { key: "pools", icon: <AppstoreOutlined />, label: "股票池管理" },
+    { key: "plans", icon: <ThunderboltOutlined />, label: "交易计划" },
+    { key: "factors", icon: <GoldOutlined />, label: "因子注册表" },
+    { key: "screen", icon: <ExperimentOutlined />, label: "筛选择股" },
+    { key: "backtest", icon: <StockOutlined />, label: "策略回测" },
+    { key: "risk", icon: <SafetyOutlined />, label: "风控设置" },
+  ];
+
   return (
     <ConfigProvider
       theme={{
         algorithm: [theme.defaultAlgorithm, theme.compactAlgorithm],
         token: {
-          colorPrimary: "#2563eb",
+          colorPrimary: "#1677ff",
           colorInfo: "#1677ff",
-          colorSuccess: "#16a34a",
-          colorWarning: "#d97706",
-          colorError: "#dc2626",
-          colorBgLayout: "#f3f6fb",
+          colorSuccess: "#15803d",
+          colorWarning: "#b45309",
+          colorError: "#b91c1c",
+          colorBgLayout: "#f7f8fa",
           colorBgContainer: "#ffffff",
           colorBgElevated: "#ffffff",
-          colorBorder: "#d8dee8",
-          colorText: "#172033",
-          colorTextSecondary: "#667085",
-          borderRadius: 6,
-          fontFamily: "Arial, Helvetica, sans-serif",
+          colorBorder: "#e4e7ec",
+          colorBorderSecondary: "#eef0f3",
+          colorText: "#101828",
+          colorTextSecondary: "#475467",
+          colorTextTertiary: "#667085",
+          borderRadius: 8,
+          borderRadiusLG: 10,
+          borderRadiusSM: 6,
+          boxShadow: "0 1px 2px rgba(16, 24, 40, 0.04)",
+          boxShadowSecondary: "0 1px 2px rgba(16, 24, 40, 0.04)",
+          fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Roboto, Helvetica, Arial, sans-serif",
+          fontSize: 14,
+        },
+        components: {
+          Card: { headerFontSize: 14, headerHeight: 44, paddingLG: 18 },
+          Table: { headerBg: "#f9fafb", headerColor: "#475467", rowHoverBg: "#f9fafb", borderColor: "#eef0f3" },
+          Menu: { itemHeight: 40, itemMarginInline: 8, itemBorderRadius: 6, itemSelectedBg: "#eff6ff", itemSelectedColor: "#1677ff" },
+          Layout: { siderBg: "#ffffff", headerBg: "#ffffff", headerHeight: 60, headerPadding: "0 24px" },
+          Button: { controlHeight: 36, fontWeight: 500 },
+          Tag: { defaultBg: "#f2f4f7", defaultColor: "#344054" },
         },
       }}
     >
@@ -931,31 +1247,66 @@ export default function Home() {
         <Sider width={236} className="mq-sider" breakpoint="lg" collapsedWidth="0">
           <div className="mq-logo">
             <span className="mq-logo-mark"><FundProjectionScreenOutlined /></span>
-            <span>MyQuant</span>
+            <span className="mq-logo-text">MyQuant</span>
+            <span className="mq-version">v{APP_VERSION}</span>
           </div>
           <Menu
             mode="inline"
             selectedKeys={[activeSection]}
             onClick={({ key }) => setActiveSection(key as SectionKey)}
-            items={[
-              { key: "dashboard", icon: <DashboardOutlined />, label: "数据概览" },
-              { key: "update", icon: <DatabaseOutlined />, label: "数据更新" },
-              { key: "screen", icon: <ExperimentOutlined />, label: "筛选择股" },
-              { key: "backtest", icon: <StockOutlined />, label: "策略回测" },
-            ]}
+            items={navItems}
           />
         </Sider>
-        <Layout>
+        <Layout className="mq-main-layout">
           <Header className="mq-header">
-            <div className="mq-title-row">
-              <div>
-                <h1 className="mq-page-title">{pageTitle}</h1>
-                <p className="mq-page-subtitle">{pageSubtitle}</p>
+            <div className="mq-header-row">
+              <div className="mq-header-title-group">
+                <Button
+                  className="mq-mobile-nav-trigger"
+                  type="text"
+                  icon={<MenuOutlined />}
+                  onClick={() => setMobileNavOpen(true)}
+                  aria-label="打开导航"
+                />
+                <div className="mq-crumb">
+                  <span className="mq-crumb-root">MyQuant</span>
+                  <span className="mq-version">v{APP_VERSION}</span>
+                  <span className="mq-crumb-sep">/</span>
+                  <span className="mq-crumb-current">{pageTitle}</span>
+                </div>
               </div>
-              <Button icon={<ReloadOutlined />} onClick={loadDashboard}>刷新</Button>
+              <div className="mq-header-actions">
+                <Button icon={<MessageOutlined />} onClick={() => openAgent({ scene: "global_chat", userInput: "请结合当前页面说明下一步建议操作", payload: { active_section: activeSection } })}>AI 助手</Button>
+                <Button icon={<ReloadOutlined />} onClick={loadDashboard}>刷新</Button>
+              </div>
             </div>
+            <div className="mq-header-sub">{pageSubtitle}</div>
           </Header>
+          <Drawer
+            className="mq-mobile-nav-drawer"
+            title="MyQuant"
+            placement="left"
+            size="default"
+            open={mobileNavOpen}
+            onClose={() => setMobileNavOpen(false)}
+          >
+            <Menu
+              mode="inline"
+              selectedKeys={[activeSection]}
+              onClick={({ key }) => {
+                setActiveSection(key as SectionKey);
+                setMobileNavOpen(false);
+              }}
+              items={navItems}
+            />
+          </Drawer>
           <Content className="mq-content">
+            <TaskStatusBar
+              task={updateTask}
+              actionLabel={updateTask ? updateActionLabels[updateTask.action] : ""}
+              onCancel={cancelUpdateTask}
+              onJumpToUpdate={activeSection === "update" ? undefined : () => setActiveSection("update")}
+            />
             {error ? <Alert type="error" title={error} showIcon style={{ marginBottom: 16 }} /> : null}
 
             {activeSection === "dashboard" ? (
@@ -992,35 +1343,30 @@ export default function Home() {
                   </Row>
                 </Card>
 
-                <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-                  <Col xs={24} md={8}>
-                    <Card className="mq-card mq-status-card">
-                      <Space orientation="vertical" size={6}>
-                        <Tag color="green">可实盘使用</Tag>
-                        <Text strong>数据已覆盖最新交易日</Text>
-                        <Text type="secondary">行情完整，基础面和因子可用，可作为交易前研究输入。</Text>
-                      </Space>
-                    </Card>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Card className="mq-card mq-status-card">
-                      <Space orientation="vertical" size={6}>
-                        <Tag color="gold">可研究使用</Tag>
-                        <Text strong>数据落后 1-2 个交易日</Text>
-                        <Text type="secondary">因子仍可分析，但结果不建议直接用于实盘下单。</Text>
-                      </Space>
-                    </Card>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Card className="mq-card mq-status-card">
-                      <Space orientation="vertical" size={6}>
-                        <Tag color="red">禁止选股</Tag>
-                        <Text strong>行情、基础面或因子不可用</Text>
-                        <Text type="secondary">请先更新或修复缓存，再生成候选名单。</Text>
-                      </Space>
-                    </Card>
-                  </Col>
-                </Row>
+                <Collapse
+                  ghost
+                  className="mq-rating-collapse"
+                  items={[{
+                    key: "rating",
+                    label: <span className="mq-rating-label">数据评级标准</span>,
+                    children: (
+                      <div className="mq-rating-strip">
+                        <div className="mq-rating-item">
+                          <Tag color="green">可实盘使用</Tag>
+                          <Text type="secondary">行情完整，基础面和因子可用，可作为交易前研究输入。</Text>
+                        </div>
+                        <div className="mq-rating-item">
+                          <Tag color="gold">可研究使用</Tag>
+                          <Text type="secondary">数据落后 1-2 个交易日，因子仍可分析，不建议直接实盘。</Text>
+                        </div>
+                        <div className="mq-rating-item">
+                          <Tag color="red">禁止选股</Tag>
+                          <Text type="secondary">行情、基础面或因子不可用，请先更新或修复缓存。</Text>
+                        </div>
+                      </div>
+                    ),
+                  }]}
+                />
 
                 <Row gutter={[16, 16]}>
                   <Col xs={24} sm={12} lg={6}>
@@ -1072,20 +1418,21 @@ export default function Home() {
                   </Row>
                 </Card>
 
-                <h2 className="mq-section-title">因子可用性</h2>
-                <Space wrap>
-                  {Object.entries(factorStatus).map(([name, ok]) => boolTag(ok, `${name}可用`, `${name}不足`))}
-                </Space>
+                <Card className="mq-card" title="因子可用性" style={{ marginTop: 16 }}>
+                  <Space wrap size={[8, 8]}>
+                    {Object.entries(factorStatus).map(([name, ok]) => boolTag(ok, `${name}可用`, `${name}不足`))}
+                  </Space>
+                </Card>
 
-                <h2 className="mq-section-title">更新历史</h2>
-                <Table
-                  className="mq-card"
-                  rowKey="id"
-                  columns={historyColumns}
-                  dataSource={taskHistory}
-                  pagination={false}
-                  size="small"
-                />
+                <Card className="mq-card" title="更新历史" style={{ marginTop: 16 }} styles={{ body: { padding: 0 } }}>
+                  <Table
+                    rowKey="id"
+                    columns={historyColumns}
+                    dataSource={taskHistory}
+                    pagination={false}
+                    size="small"
+                  />
+                </Card>
               </>
             ) : activeSection === "update" ? (
               <>
@@ -1124,6 +1471,34 @@ export default function Home() {
                             <InputNumber min={1} max={16} value={downloadWorkers} onChange={(value) => setDownloadWorkers(Number(value ?? 2))} style={{ width: "100%" }} />
                           </div>
                         </div>
+                        <div>
+                          <span className="mq-label">更新速度策略</span>
+                          <Select
+                            value={updateSpeedProfile}
+                            onChange={(value) => applyUpdateSpeedProfile(value as UpdateSpeedProfile)}
+                            options={Object.entries(updateSpeedProfiles).map(([value, cfg]) => ({ value, label: cfg.label }))}
+                            style={{ width: "100%" }}
+                          />
+                        </div>
+                        <div className="mq-filter-grid">
+                          <div>
+                            <span className="mq-label">最小请求间隔(秒)</span>
+                            <InputNumber min={0} max={5} step={0.05} value={tsMinIntervalSec} onChange={(value) => setTsMinIntervalSec(Number(value ?? 0.15))} style={{ width: "100%" }} />
+                          </div>
+                          <div>
+                            <span className="mq-label">批量窗口天数</span>
+                            <InputNumber min={1} max={10} value={batchTradeDateMaxDays} onChange={(value) => setBatchTradeDateMaxDays(Number(value ?? 7))} style={{ width: "100%" }} />
+                          </div>
+                          <div>
+                            <span className="mq-label">批量分块大小</span>
+                            <InputNumber min={20} max={1000} value={batchTickerChunkSize} onChange={(value) => setBatchTickerChunkSize(Number(value ?? 200))} style={{ width: "100%" }} />
+                          </div>
+                          <div>
+                            <span className="mq-label">启用批量最小标的数</span>
+                            <InputNumber min={1} max={5000} value={batchMinTickers} onChange={(value) => setBatchMinTickers(Number(value ?? 10))} style={{ width: "100%" }} />
+                          </div>
+                        </div>
+                        <Text type="secondary">默认推荐均衡模式；若你只做近 1-2 日增量，优先使用快速模式。</Text>
                         <Space>
                           <Switch checked={includeStaleTickers} onChange={setIncludeStaleTickers} />
                           <Text>修复行情时同时补齐日期落后标的</Text>
@@ -1132,92 +1507,83 @@ export default function Home() {
                     </Card>
                   </Col>
                   <Col xs={24} lg={14}>
-                    <Card className="mq-card" title="按问题推荐操作">
-                      <Row gutter={[12, 12]}>
-                        {(["sync_latest", "repair_price", "refresh_fundamentals"] as UpdateAction[]).map((action) => {
-                          const meta = actionMeta[action];
-                          const recommended = recommendedAction === action;
-                          return (
-                            <Col xs={24} md={8} key={action}>
-                              <Card className={`mq-action-card ${recommended ? "mq-action-card-recommended" : ""}`} size="small">
-                                <Space orientation="vertical" size={8} style={{ width: "100%" }}>
-                                  {recommended ? <div className="mq-recommended-ribbon">当前推荐</div> : null}
-                                  <Space wrap>
-                                    <Text strong>{updateActionLabels[action]}</Text>
-                                    {recommended ? <Tag color="blue">推荐当前执行</Tag> : <Tag>按需</Tag>}
-                                    <Tag color={meta.risk === "低" ? "green" : meta.risk === "中" ? "gold" : "red"}>{meta.risk}风险</Tag>
-                                  </Space>
-                                  <Text type="secondary">需要时机：{meta.when}</Text>
-                                  <Text type="secondary">更新内容：{meta.updates}</Text>
-                                  <Text type="secondary">缓存影响：{meta.overwrite}</Text>
-                                  <Text type="secondary">预计耗时：{meta.duration}</Text>
-                                  {recommended ? <Alert type="info" showIcon title="建议优先执行此操作" description={diagnostic?.full_conclusion} /> : null}
-                                  <Button type={recommended ? "primary" : "default"} block loading={updateTaskLoading} onClick={() => confirmStartUpdate(action)}>{updateActionLabels[action]}</Button>
+                    <div className="mq-section-label">按问题推荐操作</div>
+                    <Row gutter={[12, 12]}>
+                      {(["sync_latest", "repair_price", "refresh_fundamentals"] as UpdateAction[]).map((action) => {
+                        const meta = actionMeta[action];
+                        const recommended = recommendedAction === action;
+                        return (
+                          <Col xs={24} md={8} key={action}>
+                            <Card className={`mq-card mq-action-card ${recommended ? "mq-action-card-recommended" : ""}`} size="small">
+                              <Space orientation="vertical" size={8} style={{ width: "100%" }}>
+                                {recommended ? <div className="mq-recommended-ribbon">当前推荐</div> : null}
+                                <Space wrap>
+                                  <Text strong>{updateActionLabels[action]}</Text>
+                                  {recommended ? <Tag color="blue">推荐当前执行</Tag> : <Tag>按需</Tag>}
+                                  <Tag color={meta.risk === "低" ? "green" : meta.risk === "中" ? "gold" : "red"}>{meta.risk}风险</Tag>
                                 </Space>
-                              </Card>
-                            </Col>
-                          );
-                        })}
-                      </Row>
+                                <Text type="secondary">需要时机：{meta.when}</Text>
+                                <Text type="secondary">更新内容：{meta.updates}</Text>
+                                <Text type="secondary">缓存影响：{meta.overwrite}</Text>
+                                <Text type="secondary">预计耗时：{meta.duration}</Text>
+                                {recommended ? <Alert type="info" showIcon title="建议优先执行此操作" description={diagnostic?.full_conclusion} /> : null}
+                                <Button type={recommended ? "primary" : "default"} block loading={updateTaskLoading} onClick={() => confirmStartUpdate(action)}>{updateActionLabels[action]}</Button>
+                              </Space>
+                            </Card>
+                          </Col>
+                        );
+                      })}
+                    </Row>
 
-                      <Collapse
-                        ghost
-                        style={{ marginTop: 12 }}
-                        items={[
-                          {
-                            key: "advanced",
-                            label: "高级操作",
-                            children: (
-                              <Card className="mq-action-card" size="small">
-                                <Space orientation="vertical" size={8} style={{ width: "100%" }}>
-                                  <Space wrap>
-                                    <Text strong>{updateActionLabels.rebuild_price}</Text>
-                                    <Tag color="red">高风险</Tag>
-                                    <Tag>严重异常时使用</Tag>
-                                  </Space>
-                                  <Text type="secondary">需要时机：{actionMeta.rebuild_price.when}</Text>
-                                  <Text type="secondary">更新内容：{actionMeta.rebuild_price.updates}</Text>
-                                  <Text type="secondary">缓存影响：{actionMeta.rebuild_price.overwrite}</Text>
-                                  <Text type="secondary">预计耗时：{actionMeta.rebuild_price.duration}</Text>
-                                  <Button danger loading={updateTaskLoading} onClick={() => confirmStartUpdate("rebuild_price")}>{updateActionLabels.rebuild_price}</Button>
+                    <Collapse
+                      ghost
+                      style={{ marginTop: 12 }}
+                      items={[
+                        {
+                          key: "advanced",
+                          label: "高级操作",
+                          children: (
+                            <div className="mq-action-card mq-action-card-flat">
+                              <Space orientation="vertical" size={8} style={{ width: "100%" }}>
+                                <Space wrap>
+                                  <Text strong>{updateActionLabels.rebuild_price}</Text>
+                                  <Tag color="red">高风险</Tag>
+                                  <Tag>严重异常时使用</Tag>
                                 </Space>
-                              </Card>
-                            ),
-                          },
-                        ]}
-                      />
-                    </Card>
+                                <Text type="secondary">需要时机：{actionMeta.rebuild_price.when}</Text>
+                                <Text type="secondary">更新内容：{actionMeta.rebuild_price.updates}</Text>
+                                <Text type="secondary">缓存影响：{actionMeta.rebuild_price.overwrite}</Text>
+                                <Text type="secondary">预计耗时：{actionMeta.rebuild_price.duration}</Text>
+                                <Button danger loading={updateTaskLoading} onClick={() => confirmStartUpdate("rebuild_price")}>{updateActionLabels.rebuild_price}</Button>
+                              </Space>
+                            </div>
+                          ),
+                        },
+                      ]}
+                    />
                   </Col>
                 </Row>
 
                 {updateTask ? (
-                  <Card className="mq-card" title="任务状态" style={{ marginTop: 16 }}>
+                  <Card className="mq-card" title="最近任务结果" style={{ marginTop: 16 }}>
                     <Space orientation="vertical" size={10} style={{ width: "100%" }}>
-                      <Space wrap>
-                        <Tag color={updateTask.status === "succeeded" ? "green" : updateTask.status === "failed" ? "red" : "blue"}>{updateTask.status}</Tag>
-                        <Text strong>{updateActionLabels[updateTask.action]}</Text>
-                        <Text type="secondary">{updateTask.message}</Text>
-                      </Space>
-                      <div>
-                        <span className="mq-label">股票级进度</span>
-                        <Progress percent={Math.round((updateTask.progress ?? 0) * 100)} />
-                      </div>
-                      <div>
-                        <span className="mq-label">分段下载进度</span>
-                        <Progress percent={Math.round((updateTask.chunk_progress ?? 0) * 100)} />
-                      </div>
                       {updateTask.error ? <Alert type="error" title={updateTask.error} showIcon /> : null}
+                      {updateTask.warning ? <Alert type="warning" title={updateTask.warning} showIcon /> : null}
                       {updateTask.result?.stats ? (
                         <Alert
-                          type={updateTask.status === "failed" ? "error" : "success"}
+                          type={updateTask.status === "failed" ? "error" : updateTask.status === "cancelled" ? "warning" : "success"}
                           showIcon
-                          title={updateTask.status === "succeeded" ? "更新完成" : "更新结果"}
-                          description={`更新股票 ${updateTask.result.stats.tickers_updated ?? 0} 只，新增行情 ${updateTask.result.stats.rows_appended ?? 0} 条，修复请求 ${updateTask.result.stats.repair_requested ?? 0} 个；当前数据${summary?.diagnostic?.can_screen ? "可用于选股" : "仍建议检查异常明细"}${updateTask.result.cache_range ? `；缓存范围 ${updateTask.result.cache_range.join(" ~ ")}` : ""}`}
+                          title={updateTask.status === "succeeded" ? "更新完成" : updateTask.status === "cancelled" ? "任务已取消" : "更新结果"}
+                          description={`本轮需下载 ${updateTask.result.stats.total_tickers ?? updateTask.result.stats.tickers_requested ?? 0} 只，已处理 ${updateTask.result.stats.processed_tickers ?? 0} 只；更新 ${updateTask.result.stats.tickers_updated ?? 0} 只，跳过 ${updateTask.result.stats.tickers_skipped ?? 0} 只，失败 ${updateTask.result.stats.tickers_failed ?? 0} 只；新增行情 ${updateTask.result.stats.rows_appended ?? 0} 条，修复请求 ${updateTask.result.stats.repair_requested ?? 0} 个；${taskPostCheckText}${updateTask.result.cache_range ? `；缓存范围 ${updateTask.result.cache_range.join(" ~ ")}` : ""}`}
                         />
-                      ) : null}
+                      ) : (
+                        <Text type="secondary">实时进度已收口至页面顶部的全局任务条。</Text>
+                      )}
                     </Space>
                   </Card>
                 ) : null}
+
+                <SnapshotsPanel apiBase={API_BASE} />
               </>
             ) : activeSection === "screen" ? (
               <>
@@ -1242,24 +1608,106 @@ export default function Home() {
                 <h2 className="mq-section-title">筛选参数</h2>
                 <Card className="mq-card">
               <div className="mq-industry-filter">
-                <span className="mq-label">按板块/行业筛选</span>
-                <Select
-                  mode="multiple"
-                  allowClear
-                  showSearch
-                  maxTagCount="responsive"
-                  placeholder="不选择则在全市场股票池中筛选"
-                  value={selectedIndustries}
-                  options={industrySelectOptions}
-                  onChange={setSelectedIndustries}
-                  optionFilterProp="label"
-                  style={{ width: "100%" }}
-                />
-                <div className="mq-card-note">
-                  {selectedIndustries.length
-                    ? `将先限定在 ${selectedIndustries.length} 个板块/行业内，再执行风险过滤和多因子打分。`
-                    : `当前共有 ${industryOptions.length} 个行业可选；留空表示全市场筛选。`}
-                </div>
+                <span className="mq-label">筛选范围</span>
+                <Radio.Group
+                  value={filterMode}
+                  onChange={(e) => {
+                    const next = e.target.value as "all" | "industry" | "concept";
+                    setFilterMode(next);
+                    if (next === "concept" && conceptOptions.length === 0 && !conceptsLoading) {
+                      setConceptsLoading(true);
+                      void fetch(`${API_BASE}/api/screen/concepts`)
+                        .then((r) => r.json())
+                        .then((data: { concepts?: { ts_code: string; name: string; count: number }[] }) => {
+                          setConceptOptions(data.concepts ?? []);
+                          if ((data.concepts ?? []).length === 0) {
+                            void message.warning("暂未拉取到概念数据，请检查服务器日志");
+                          }
+                        })
+                        .catch(() => { void message.error("概念板块加载失败"); })
+                        .finally(() => setConceptsLoading(false));
+                    }
+                  }}
+                  optionType="button"
+                  buttonStyle="solid"
+                  style={{ marginBottom: 8, width: "100%" }}
+                >
+                  <Radio.Button value="all" style={{ width: "33.33%", textAlign: "center" }}>全市场</Radio.Button>
+                  <Radio.Button value="industry" style={{ width: "33.33%", textAlign: "center" }}>按行业</Radio.Button>
+                  <Radio.Button value="concept" style={{ width: "33.33%", textAlign: "center" }}>按热门主题</Radio.Button>
+                </Radio.Group>
+
+                {filterMode === "all" && (
+                  <div className="mq-card-note">在全部 {industryOptions.reduce((s, i) => s + i.count, 0) || "N/A"} 只小盘股中按因子打分。</div>
+                )}
+
+                {filterMode === "industry" && (
+                  <>
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      showSearch
+                      maxTagCount="responsive"
+                      placeholder="搜索行业名称，可多选（互为并集）"
+                      value={selectedIndustries}
+                      options={industrySelectOptions}
+                      onChange={setSelectedIndustries}
+                      optionFilterProp="label"
+                      style={{ width: "100%" }}
+                    />
+                    <div className="mq-card-note">
+                      {selectedIndustries.length
+                        ? `已选 ${selectedIndustries.length} 个行业，多选取并集后按因子打分。`
+                        : `共 ${industryOptions.length} 个行业，不选相当于全市场。`}
+                    </div>
+                  </>
+                )}
+
+                {filterMode === "concept" && (
+                  <>
+                    <Space.Compact style={{ width: "100%" }}>
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        showSearch
+                        maxTagCount="responsive"
+                        placeholder={conceptsLoading ? "正在加载概念板块数据…" : "搜索主题名称，如 AI、机器人、光伏"}
+                        value={selectedConcepts}
+                        options={conceptSelectOptions}
+                        onChange={setSelectedConcepts}
+                        optionFilterProp="label"
+                        loading={conceptsLoading}
+                        notFoundContent={conceptsLoading ? "加载中…" : "暂无数据"}
+                        style={{ flex: 1 }}
+                      />
+                      <Button
+                        loading={conceptsLoading}
+                        onClick={() => {
+                          setConceptsLoading(true);
+                          void fetch(`${API_BASE}/api/screen/concepts/refresh`, { method: "POST" })
+                            .then((r) => r.json())
+                            .then(() => fetch(`${API_BASE}/api/screen/concepts`))
+                            .then((r) => r.json())
+                            .then((data: { concepts?: { ts_code: string; name: string; count: number }[] }) => {
+                              setConceptOptions(data.concepts ?? []);
+                              void message.success(`已加载 ${data.concepts?.length ?? 0} 个主题`);
+                            })
+                            .catch(() => { void message.error("加载失败"); })
+                            .finally(() => setConceptsLoading(false));
+                        }}
+                      >
+                        {conceptOptions.length === 0 ? "加载主题" : "重新加载"}
+                      </Button>
+                    </Space.Compact>
+                    <div className="mq-card-note">
+                      {conceptOptions.length === 0
+                        ? `点击“加载主题”按钮，按行业关键词匹配 AI、机器人、光伏等热门概念范围（即时返回）。`
+                        : selectedConcepts.length
+                          ? `已选 ${selectedConcepts.length} 个主题，将在这些概念股中进行因子打分。多选取并集。`
+                          : `共 ${conceptOptions.length} 个热门主题，多选取并集，不选相当于全市场。`}
+                    </div>
+                  </>
+                )}
               </div>
               <div className="mq-toolbar">
                 <div className="mq-control-cell mq-control-wide">
@@ -1319,6 +1767,20 @@ export default function Home() {
               <Space className="mq-action-row" wrap>
                 <Button type="primary" icon={<ExperimentOutlined />} loading={loading} disabled={diagnostic ? !diagnostic.can_screen : true} onClick={runScreen}>执行筛选</Button>
                 <Button onClick={() => applyTemplate(selectedTemplate)}>恢复模板默认权重</Button>
+                <Button icon={<MessageOutlined />} onClick={() => openAgent({
+                  scene: "screen_explain",
+                  userInput: "请解释本次筛选结果，并给出三条可执行调参建议",
+                  payload: {
+                    template_name: selectedTemplate,
+                    industries: selectedIndustries,
+                    top_n: topN,
+                    industry_neutral: industryNeutral,
+                    weights,
+                    filters,
+                    removed,
+                    rows: rows.slice(0, 20),
+                  },
+                })}>解释筛选结果</Button>
                 <Button disabled={!rows.length} onClick={() => handleRowsForBacktest("screen")}>用筛选结果回测</Button>
                 <Button disabled={!watchlist.length} onClick={() => handleRowsForBacktest("watchlist")}>用观察池回测</Button>
                 <Text type="secondary">观察池 {watchlist.length} 只</Text>
@@ -1358,14 +1820,16 @@ export default function Home() {
                   rowKey="ticker"
                   dataSource={watchlist}
                   columns={watchlistColumns}
-                  loading={watchlistLoading}
                   scroll={{ x: 1500 }}
                   pagination={{ pageSize: 10 }}
                   size="small"
                 />
               </>
-            ) : (
+            ) : activeSection === "backtest" ? (
               <>
+                <div style={{ marginBottom: 16 }}>
+                  <RollingBacktestPanel apiBase={API_BASE} />
+                </div>
                 <Alert
                   type="warning"
                   showIcon
@@ -1426,6 +1890,37 @@ export default function Home() {
                           <Switch checked={allowFallbackUniverse} onChange={setAllowFallbackUniverse} />
                           <Text>无交集时回退到缓存内标的</Text>
                         </Space>
+                        <Button
+                          icon={<MessageOutlined />}
+                          disabled={!backtestResult}
+                          onClick={() => backtestResult ? openAgent({
+                            scene: "backtest_review",
+                            userInput: "请复盘本次回测，给出收益来源解释、主要风险与下一轮实验方案",
+                            payload: {
+                              selected_strategies: selectedStrategies,
+                              params: {
+                                start_date: backtestStartDate,
+                                end_date: backtestEndDate,
+                                holding_count: holdingCount,
+                                fees: backtestFees,
+                                slippage: backtestSlippage,
+                                fast_window: fastWindow,
+                                slow_window: slowWindow,
+                                mom_window: momWindow,
+                                top_pct: topPct,
+                                rsi_window: rsiWindow,
+                                rsi_buy: rsiBuy,
+                                rsi_sell: rsiSell,
+                                benchmark_name: benchmarkName,
+                              },
+                              metrics: backtestResult.metrics,
+                              stats: backtestResult.stats,
+                              strategies: backtestResult.strategies,
+                              signals: (backtestResult.signals ?? []).slice(0, 40),
+                              advice: (backtestResult.advice ?? []).slice(0, 40),
+                            },
+                          }) : undefined}
+                        >复盘本次回测</Button>
                         <Button type="primary" icon={<StockOutlined />} loading={backtestLoading} disabled={!backtestRows.length || backtestMode === "rolling"} onClick={runBacktest}>运行回测</Button>
                         <Text type="secondary">当前来源可用 {backtestRows.length} 只，实际使用前 {holdingCount} 只。</Text>
                       </Space>
@@ -1533,7 +2028,20 @@ export default function Home() {
                   </>
                 ) : null}
               </>
-            )}
+            ) : activeSection === "pools" ? (
+              <PoolsPanel apiBase={API_BASE} onOpenAgent={openAgent} />
+            ) : activeSection === "plans" ? (
+              <PlansPanel apiBase={API_BASE} />
+            ) : activeSection === "recommend" ? (
+              <RecommendPanel apiBase={API_BASE} onOpenAgent={openAgent} />
+            ) : activeSection === "factors" ? (
+              <FactorsPanel apiBase={API_BASE} />
+            ) : activeSection === "risk" ? (
+              <Space orientation="vertical" size={16} style={{ width: "100%" }}>
+                <RiskPanel apiBase={API_BASE} />
+                <ScenarioPanel apiBase={API_BASE} />
+              </Space>
+            ) : null}
           </Content>
         </Layout>
       </Layout>
@@ -1611,10 +2119,29 @@ export default function Home() {
             <Card className="mq-card" size="small" title="风险提示">
               <Space wrap>{splitReasonAndRisk(selectedStock.入选原因).risks.map((item) => <Tag color={item.includes("暂未") ? "green" : "orange"} key={item}>{item}</Tag>)}</Space>
             </Card>
-            <Button type="primary" icon={<PlusOutlined />} loading={watchlistLoading} onClick={() => void addToWatchlist(selectedStock)} disabled={watchlist.some((item) => item.ticker === selectedStock.ticker)}>加入观察池</Button>
+            <StockNewsCard apiBase={API_BASE} ticker={selectedStock.ticker} name={selectedStock.名称} onOpenAgent={openAgent} />
+            <Button
+              icon={<MessageOutlined />}
+              onClick={() => openAgent({
+                scene: "stock_diagnosis",
+                userInput: `请对 ${selectedStock.ticker} 做交易前诊断，并给出三条可执行跟踪动作`,
+                payload: {
+                  ticker: selectedStock.ticker,
+                  selected_stock: selectedStock,
+                },
+              })}
+            >Agent 诊断</Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => addToWatchlist(selectedStock)} disabled={watchlist.some((item) => item.ticker === selectedStock.ticker)}>加入观察池</Button>
           </Space>
         ) : null}
       </Drawer>
+      <AgentAssistantDrawer
+        apiBase={API_BASE}
+        open={agentOpen}
+        onClose={() => setAgentOpen(false)}
+        draft={agentDraft}
+        onWatchlistChange={() => setWatchlist(loadWatchlist() as unknown as ScreenRow[])}
+      />
       <Modal
         title={tickerModal?.title}
         open={Boolean(tickerModal)}
@@ -1625,7 +2152,7 @@ export default function Home() {
         <Table
           rowKey="ticker"
           dataSource={(tickerModal?.tickers ?? []).map((ticker) => ({ ticker }))}
-          columns={[{ title: "股票代码", dataIndex: "ticker" }]}
+          columns={[{ title: "股票", dataIndex: "ticker", render: (value: string) => <TickerCell ticker={value} layout="stack" /> }]}
           size="small"
           pagination={{ pageSize: 12 }}
         />

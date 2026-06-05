@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from threading import Lock, Thread
+from time import perf_counter
+from threading import Event, Lock, Thread
 from typing import Any
 from uuid import uuid4
 
@@ -13,12 +14,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import web_app
+from myquant.tushare_client import DEFAULT_TUSHARE_HTTP_URL
 
 
 class ScreenRequest(BaseModel):
     template_name: str = Field(default="趋势质量股")
     top_n: int = Field(default=30, ge=1, le=500)
     industries: list[str] = Field(default_factory=list)
+    concept_codes: list[str] = Field(default_factory=list)
     weights: dict[str, float] | None = None
     filters: dict[str, Any] | None = None
     industry_neutral: bool = True
@@ -28,9 +31,13 @@ class ScreenRequest(BaseModel):
 class UpdateTaskRequest(BaseModel):
     action: str = Field(default="sync_latest")
     token: str | None = None
-    http_url: str = Field(default="http://teajoin.com")
+    http_url: str = Field(default=DEFAULT_TUSHARE_HTTP_URL)
     start_date: str = Field(default="2025-06-01")
     download_workers: int = Field(default=2, ge=1, le=16)
+    ts_min_interval_sec: float = Field(default=0.15, ge=0.0, le=5.0)
+    batch_trade_date_max_days: int = Field(default=7, ge=1, le=10)
+    batch_ticker_chunk_size: int = Field(default=200, ge=20, le=1000)
+    batch_min_tickers: int = Field(default=10, ge=1, le=5000)
     include_stale_tickers: bool = True
 
 
@@ -104,10 +111,51 @@ app = FastAPI(title="MyQuant API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origin_regex=(
+        r"https?://("
+        r"localhost|127\.0\.0\.1|"
+        r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+        r"172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|"
+        r"192\.168\.\d{1,3}\.\d{1,3}"
+        r")(:\d+)?"
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Phase 1 startup: 建表 + 旧 watchlist 迁移 + 因子注册表 + 风控默认值
+from myquant.migrations import run_startup_migrations as _run_startup_migrations  # noqa: E402
+
+_STARTUP_MIGRATION_RESULT = _run_startup_migrations()
+
+# Phase 1 routers
+from .routers import factors as _factors_router  # noqa: E402
+from .routers import backtest as _backtest_router  # noqa: E402
+from .routers import scenario as _scenario_router  # noqa: E402
+from .routers import plans as _plans_router  # noqa: E402
+from .routers import pools as _pools_router  # noqa: E402
+from .routers import recommend as _recommend_router  # noqa: E402
+from .routers import risk as _risk_router  # noqa: E402
+from .routers import screen as _screen_router  # noqa: E402
+from .routers import snapshots as _snapshots_router  # noqa: E402
+from .routers import stock as _stock_router  # noqa: E402
+from .routers import timing as _timing_router  # noqa: E402
+from .routers import agent as _agent_router  # noqa: E402
+
+app.include_router(_pools_router.router)
+app.include_router(_factors_router.router)
+app.include_router(_screen_router.router)
+app.include_router(_risk_router.router)
+app.include_router(_timing_router.router)
+app.include_router(_plans_router.router)
+app.include_router(_recommend_router.router)
+app.include_router(_stock_router.router)
+app.include_router(_snapshots_router.router)
+app.include_router(_backtest_router.router)
+app.include_router(_scenario_router.router)
+app.include_router(_agent_router.router)
 
 
 TASKS: dict[str, dict[str, Any]] = {}
@@ -135,6 +183,14 @@ class TaskStatusText:
         update_task(self.task_id, message=str(value).replace("**", ""))
 
 
+class TaskDownloadStats:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+    def update(self, value: dict[str, int]) -> None:
+        update_task(self.task_id, download_stats=sanitize(value))
+
+
 def utc_now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -148,17 +204,21 @@ def update_task(task_id: str, **updates: Any) -> None:
         task["updated_at"] = utc_now()
 
 
+def _public_task_fields(task: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in task.items() if not isinstance(v, Event)}
+
+
 def snapshot_task(task_id: str) -> dict[str, Any]:
     with TASKS_LOCK:
         task = TASKS.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        return sanitize(dict(task))
+        return sanitize(_public_task_fields(task))
 
 
 def has_running_task() -> bool:
     with TASKS_LOCK:
-        return any(task.get("status") in {"queued", "running"} for task in TASKS.values())
+        return any(task.get("status") in {"queued", "running", "cancelling"} for task in TASKS.values())
 
 
 def task_duration_seconds(task: dict[str, Any]) -> float | None:
@@ -179,7 +239,7 @@ def task_history(limit: int = 10) -> list[dict[str, Any]]:
         tasks = sorted(TASKS.values(), key=lambda item: str(item.get("created_at", "")), reverse=True)
         rows = []
         for task in tasks[: max(1, min(int(limit), TASK_HISTORY_LIMIT))]:
-            row = dict(task)
+            row = _public_task_fields(task)
             row["duration_seconds"] = task_duration_seconds(row)
             rows.append(row)
         return sanitize(rows)
@@ -190,8 +250,8 @@ def latest_trade_date_from_cache() -> str | None:
     if not token:
         return None
     try:
-        pro = web_app.init_tushare_client(token, "http://teajoin.com")
-        latest_yyyymmdd = web_app.get_last_trade_date(pro, pd.Timestamp.today().strftime("%Y%m%d"))
+        pro = web_app.init_tushare_client(token, DEFAULT_TUSHARE_HTTP_URL)
+        latest_yyyymmdd = web_app.get_latest_available_trade_date(pro, pd.Timestamp.today().strftime("%Y%m%d"))
         return pd.Timestamp(latest_yyyymmdd).strftime("%Y-%m-%d")
     except Exception:
         return None
@@ -321,6 +381,42 @@ def build_cache_diagnostic(summary: dict[str, Any], readiness: dict[str, Any], l
     }
 
 
+def build_cache_post_check() -> dict[str, Any]:
+    price_cache = web_app.load_price_cache()
+    pool_cache = web_app.load_pool_cache()
+    summary = web_app.analyze_cache_completeness(price_cache_df=price_cache, pool_df=pool_cache)
+    readiness = web_app.analyze_data_readiness(price_cache, pool_cache)
+    missing_count = int(summary.get("missing_count") or 0)
+    stale_count = int(summary.get("stale_count") or 0)
+    return {
+        "price_ok": bool(readiness.get("price_ok")),
+        "missing_count": missing_count,
+        "stale_count": stale_count,
+        "price_has_gaps": missing_count > 0 or stale_count > 0 or not bool(readiness.get("price_ok")),
+        "cache_range": web_app.cache_date_range(price_cache),
+        "pool_count": int(len(pool_cache)) if isinstance(pool_cache, pd.DataFrame) else 0,
+        "price_symbol_count": int(price_cache.shape[1]) if isinstance(price_cache, pd.DataFrame) else 0,
+        "price_row_count": int(price_cache.shape[0]) if isinstance(price_cache, pd.DataFrame) else 0,
+        "missing_tickers": (summary.get("missing_tickers") or [])[:20],
+        "stale_tickers": (summary.get("stale_tickers") or [])[:20],
+        "issues": readiness.get("issues") or [],
+        "price_cache_file": str(web_app.PRICE_CACHE_FILE.resolve()),
+        "pool_cache_file": str(web_app.POOL_CACHE_FILE.resolve()),
+    }
+
+
+def attach_cache_post_check(result: dict[str, Any]) -> dict[str, Any]:
+    post_check = build_cache_post_check()
+    stats = result.setdefault("stats", {})
+    if isinstance(stats, dict):
+        stats["post_missing_count"] = int(post_check["missing_count"])
+        stats["post_stale_count"] = int(post_check["stale_count"])
+        stats["post_price_ok"] = 1 if post_check["price_ok"] else 0
+    result["post_check"] = post_check
+    result["cache_range"] = post_check["cache_range"]
+    return result
+
+
 def build_update_params(request: UpdateTaskRequest) -> web_app.AppParams:
     token = (request.token or web_app.load_token_cache() or "").strip()
     if not token:
@@ -329,7 +425,7 @@ def build_update_params(request: UpdateTaskRequest) -> web_app.AppParams:
         web_app.save_token_cache(request.token)
     return web_app.AppParams(
         token=token,
-        http_url=request.http_url.strip() or "http://teajoin.com",
+        http_url=request.http_url.strip() or DEFAULT_TUSHARE_HTTP_URL,
         start_date=pd.Timestamp(request.start_date).strftime("%Y-%m-%d"),
         end_date=pd.Timestamp.today().strftime("%Y-%m-%d"),
         init_cash=100000.0,
@@ -347,14 +443,37 @@ def build_update_params(request: UpdateTaskRequest) -> web_app.AppParams:
         rsi_buy=30,
         rsi_sell=55,
         download_workers=int(request.download_workers),
+        ts_min_interval_sec=float(request.ts_min_interval_sec),
+        batch_trade_date_max_days=int(request.batch_trade_date_max_days),
+        batch_ticker_chunk_size=int(request.batch_ticker_chunk_size),
+        batch_min_tickers=int(request.batch_min_tickers),
     )
 
 
-def run_sync_latest(task_id: str, params: web_app.AppParams) -> dict[str, Any]:
+def run_sync_latest(task_id: str, params: web_app.AppParams, cancel_event: Event | None = None) -> dict[str, Any]:
+    t0 = perf_counter()
+    timings: dict[str, float] = {}
     update_task(task_id, message="初始化 Tushare/TeaJoin 客户端")
     pro = web_app.init_tushare_client(params.token, params.http_url)
+    try:
+        today_probe = pd.Timestamp.today().strftime("%Y%m%d")
+        web_app.ts_call_with_retry(
+            lambda: pro.trade_cal(
+                exchange="SSE",
+                start_date=today_probe,
+                end_date=today_probe,
+                fields="cal_date,is_open",
+            ),
+            max_retry=1,
+            wait_sec=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Tushare 凭证或 HTTP URL 不可用，请检查 token/http_url：{exc}") from exc
+    timings["init_client_sec"] = round(perf_counter() - t0, 3)
+
+    t_pool = perf_counter()
     today_yyyymmdd = pd.Timestamp.today().strftime("%Y%m%d")
-    target_trade_yyyymmdd = web_app.get_last_trade_date(pro, today_yyyymmdd)
+    target_trade_yyyymmdd = web_app.get_latest_available_trade_date(pro, today_yyyymmdd)
     target_trade_date = pd.Timestamp(target_trade_yyyymmdd).strftime("%Y-%m-%d")
     cache_df = web_app.load_price_cache()
     pool_df = web_app.load_pool_cache()
@@ -363,6 +482,7 @@ def run_sync_latest(task_id: str, params: web_app.AppParams) -> dict[str, Any]:
         update_task(task_id, message="股票池缓存为空，先刷新股票池", progress=0.05)
         pool_df = web_app.fetch_stock_pool(pro, pool_params)
         web_app.save_pool_cache(pool_df)
+    timings["prepare_pool_sec"] = round(perf_counter() - t_pool, 3)
 
     tickers = pool_df["ticker"].astype(str).tolist() if "ticker" in pool_df.columns else []
     cache_end = None if cache_df.empty else pd.Timestamp(cache_df.index.max()).strftime("%Y-%m-%d")
@@ -382,6 +502,7 @@ def run_sync_latest(task_id: str, params: web_app.AppParams) -> dict[str, Any]:
             "target_trade_date": target_trade_date,
             "price_sync_skipped": 1,
             "pool_refresh_skipped": 1,
+            "timings": {**timings, "total_sec": round(perf_counter() - t0, 3)},
         }
         return {"stats": stats, "cache_range": web_app.cache_date_range(cache_df)}
 
@@ -389,6 +510,8 @@ def run_sync_latest(task_id: str, params: web_app.AppParams) -> dict[str, Any]:
         update_task(task_id, message="价格缓存已覆盖最新交易日，跳过价格下载", progress=0.5, chunk_progress=1.0)
         stats = {"tickers_requested": 0, "tickers_updated": 0, "rows_appended": 0, "price_sync_skipped": 1}
     else:
+        attempted_trade_date = target_trade_date
+        t_price = perf_counter()
         update_task(task_id, message=f"同步价格缓存到最新交易日 {target_trade_date}", progress=0.08)
         cache_df, stats = web_app.update_price_cache_incremental(
             pro=pro,
@@ -401,31 +524,85 @@ def run_sync_latest(task_id: str, params: web_app.AppParams) -> dict[str, Any]:
             status_text=TaskStatusText(task_id),
             stage_label="同步到最新",
             workers=int(params.download_workers),
+            save_callback=web_app.save_price_cache,
+            save_every=50,
+            cancel_event=cancel_event,
+            progress_stats_callback=TaskDownloadStats(task_id).update,
+            ts_min_interval_sec=float(params.ts_min_interval_sec),
+            batch_trade_date_max_days=int(params.batch_trade_date_max_days),
+            batch_ticker_chunk_size=int(params.batch_ticker_chunk_size),
+            batch_min_tickers=int(params.batch_min_tickers),
         )
-        web_app.save_price_cache(cache_df)
 
-    update_task(task_id, message="刷新股票池和基础面快照", progress=max(0.9, float(stats.get("tickers_updated", 0)) / max(1, len(tickers))))
-    refreshed_pool_df = web_app.fetch_stock_pool(pro, pool_params)
-    web_app.save_pool_cache(refreshed_pool_df)
-    stats["pool_total"] = int(len(refreshed_pool_df))
+        # If the latest day is partially published/unstable, retry once on the previous open day.
+        if int(stats.get("tickers_updated", 0)) == 0 and int(stats.get("tickers_failed", 0)) > 0:
+            recent_days = web_app.get_recent_open_trade_dates(pro, target_trade_yyyymmdd, lookback_days=15)
+            fallback_trade_yyyymmdd = next((d for d in recent_days if d < target_trade_yyyymmdd), None)
+            if fallback_trade_yyyymmdd:
+                fallback_trade_date = pd.Timestamp(fallback_trade_yyyymmdd).strftime("%Y-%m-%d")
+                update_task(task_id, message=f"当日下载失败，回退重试到上一交易日 {fallback_trade_date}", progress=0.12)
+                cache_df, stats = web_app.update_price_cache_incremental(
+                    pro=pro,
+                    tickers=tickers,
+                    cache_df=cache_df,
+                    initial_start_date=params.start_date,
+                    target_end_date=fallback_trade_date,
+                    progress_bar=TaskProgressBar(task_id),
+                    chunk_progress_bar=TaskProgressBar(task_id, "chunk_progress"),
+                    status_text=TaskStatusText(task_id),
+                    stage_label="回退重试同步",
+                    workers=int(params.download_workers),
+                    save_callback=web_app.save_price_cache,
+                    save_every=50,
+                    cancel_event=cancel_event,
+                    progress_stats_callback=TaskDownloadStats(task_id).update,
+                    ts_min_interval_sec=float(params.ts_min_interval_sec),
+                    batch_trade_date_max_days=int(params.batch_trade_date_max_days),
+                    batch_ticker_chunk_size=int(params.batch_ticker_chunk_size),
+                    batch_min_tickers=int(params.batch_min_tickers),
+                )
+                target_trade_date = fallback_trade_date
+                stats["target_trade_date_fallback_from"] = attempted_trade_date
+
+        web_app.save_price_cache(cache_df)
+        timings["price_sync_sec"] = round(perf_counter() - t_price, 3)
+
+    if cancel_event is not None and cancel_event.is_set():
+        stats.setdefault("pool_total", int(len(pool_df)))
+        stats.setdefault("pool_scoped", int(len(tickers)))
+        stats["target_trade_date"] = target_trade_date
+        stats.setdefault("price_sync_skipped", 0)
+        stats["pool_refresh_skipped"] = 1
+        return {"stats": stats, "cache_range": web_app.cache_date_range(cache_df)}
+
+    update_task(task_id, message="价格缓存已同步，复用现有股票池与基础面缓存", progress=1.0)
+    stats["pool_total"] = int(len(pool_df))
     stats["pool_scoped"] = int(len(tickers))
     stats["target_trade_date"] = target_trade_date
     stats.setdefault("price_sync_skipped", 0)
-    stats["pool_refresh_skipped"] = 0
+    stats["pool_refresh_skipped"] = 1
+    stats["timings"] = {**timings, "total_sec": round(perf_counter() - t0, 3)}
     return {"stats": stats, "cache_range": web_app.cache_date_range(cache_df)}
 
 
-def run_repair_price(task_id: str, params: web_app.AppParams, include_stale_tickers: bool) -> dict[str, Any]:
+def run_repair_price(task_id: str, params: web_app.AppParams, include_stale_tickers: bool, cancel_event: Event | None = None) -> dict[str, Any]:
+    t0 = perf_counter()
+    timings: dict[str, float] = {}
     update_task(task_id, message="分析行情价格缺口", progress=0.02)
     pro = web_app.init_tushare_client(params.token, params.http_url)
-    today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+    timings["init_client_sec"] = round(perf_counter() - t0, 3)
+
+    t_prepare = perf_counter()
+    today_yyyymmdd = pd.Timestamp.today().strftime("%Y%m%d")
+    target_trade_date = pd.Timestamp(web_app.get_latest_available_trade_date(pro, today_yyyymmdd)).strftime("%Y-%m-%d")
     pool_df = web_app.load_pool_cache()
     if pool_df.empty:
-        pool_params = web_app.AppParams(**{**params.__dict__, "end_date": today_str})
+        pool_params = web_app.AppParams(**{**params.__dict__, "end_date": target_trade_date})
         pool_df = web_app.fetch_stock_pool(pro, pool_params)
         web_app.save_pool_cache(pool_df)
 
     cache_df = web_app.load_price_cache()
+    timings["prepare_inputs_sec"] = round(perf_counter() - t_prepare, 3)
     summary = web_app.analyze_cache_completeness(price_cache_df=cache_df, pool_df=pool_df)
     missing_tickers = [str(x) for x in summary.get("missing_tickers", [])]
     stale_tickers = [str(x) for x in summary.get("stale_tickers", [])] if include_stale_tickers else []
@@ -440,75 +617,132 @@ def run_repair_price(task_id: str, params: web_app.AppParams, include_stale_tick
                 "missing_requested": int(len(missing_tickers)),
                 "stale_requested": int(len(stale_tickers)),
                 "repair_requested": 0,
+                "timings": {**timings, "total_sec": round(perf_counter() - t0, 3)},
             },
             "cache_range": web_app.cache_date_range(cache_df),
         }
 
+    t_repair = perf_counter()
     cache_df, stats = web_app.update_price_cache_incremental(
         pro=pro,
         tickers=repair_tickers,
         cache_df=cache_df,
         initial_start_date=params.start_date,
-        target_end_date=today_str,
+        target_end_date=target_trade_date,
         progress_bar=TaskProgressBar(task_id),
         chunk_progress_bar=TaskProgressBar(task_id, "chunk_progress"),
         status_text=TaskStatusText(task_id),
         stage_label="修复行情价格缓存",
         workers=int(params.download_workers),
+        save_callback=web_app.save_price_cache,
+        save_every=50,
+        cancel_event=cancel_event,
+        progress_stats_callback=TaskDownloadStats(task_id).update,
+        ts_min_interval_sec=float(params.ts_min_interval_sec),
+        batch_trade_date_max_days=int(params.batch_trade_date_max_days),
+        batch_ticker_chunk_size=int(params.batch_ticker_chunk_size),
+        batch_min_tickers=int(params.batch_min_tickers),
     )
     stats["pool_total"] = int(len(pool_df))
     stats["missing_requested"] = int(len(missing_tickers))
     stats["stale_requested"] = int(len(stale_tickers))
     stats["repair_requested"] = int(len(repair_tickers))
+    timings["repair_sync_sec"] = round(perf_counter() - t_repair, 3)
+    stats["timings"] = {**timings, "total_sec": round(perf_counter() - t0, 3)}
     web_app.save_price_cache(cache_df)
     return {"stats": stats, "cache_range": web_app.cache_date_range(cache_df)}
 
 
-def run_rebuild(task_id: str, params: web_app.AppParams) -> dict[str, Any]:
+def run_rebuild(task_id: str, params: web_app.AppParams, cancel_event: Event | None = None) -> dict[str, Any]:
+    t0 = perf_counter()
+    timings: dict[str, float] = {}
     update_task(task_id, message="准备全量重建价格缓存", progress=0.02)
     pro = web_app.init_tushare_client(params.token, params.http_url)
-    today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
-    pool_params = web_app.AppParams(**{**params.__dict__, "end_date": today_str})
+    timings["init_client_sec"] = round(perf_counter() - t0, 3)
+
+    t_pool = perf_counter()
+    today_yyyymmdd = pd.Timestamp.today().strftime("%Y%m%d")
+    target_trade_date = pd.Timestamp(web_app.get_latest_available_trade_date(pro, today_yyyymmdd)).strftime("%Y-%m-%d")
+    pool_params = web_app.AppParams(**{**params.__dict__, "end_date": target_trade_date})
     pool_df = web_app.fetch_stock_pool(pro, pool_params)
     web_app.save_pool_cache(pool_df)
+    timings["prepare_pool_sec"] = round(perf_counter() - t_pool, 3)
     tickers = pool_df["ticker"].astype(str).tolist()
+
+    t_rebuild = perf_counter()
     cache_df, stats = web_app.update_price_cache_incremental(
         pro=pro,
         tickers=tickers,
         cache_df=pd.DataFrame(),
         initial_start_date=params.start_date,
-        target_end_date=today_str,
+        target_end_date=target_trade_date,
         progress_bar=TaskProgressBar(task_id),
         chunk_progress_bar=TaskProgressBar(task_id, "chunk_progress"),
         status_text=TaskStatusText(task_id),
         stage_label="全量重建",
         workers=int(params.download_workers),
+        save_callback=web_app.save_price_cache,
+        save_every=50,
+        cancel_event=cancel_event,
+        progress_stats_callback=TaskDownloadStats(task_id).update,
+        ts_min_interval_sec=float(params.ts_min_interval_sec),
+        batch_trade_date_max_days=int(params.batch_trade_date_max_days),
+        batch_ticker_chunk_size=int(params.batch_ticker_chunk_size),
+        batch_min_tickers=int(params.batch_min_tickers),
     )
     stats["pool_total"] = int(len(pool_df))
     stats["pool_scoped"] = int(len(tickers))
+    timings["rebuild_sync_sec"] = round(perf_counter() - t_rebuild, 3)
+    stats["timings"] = {**timings, "total_sec": round(perf_counter() - t0, 3)}
     web_app.save_price_cache(cache_df)
     return {"stats": stats, "cache_range": web_app.cache_date_range(cache_df)}
 
 
-def execute_update_task(task_id: str, request: UpdateTaskRequest) -> None:
+def execute_update_task(task_id: str, request: UpdateTaskRequest, cancel_event: Event) -> None:
     update_task(task_id, status="running", message="任务已开始", progress=0.0, chunk_progress=0.0, started_at=utc_now())
     try:
         params = build_update_params(request)
         with TASK_EXECUTION_LOCK:
             if request.action == "sync_latest":
-                result = run_sync_latest(task_id, params)
+                result = run_sync_latest(task_id, params, cancel_event)
             elif request.action == "repair_price":
-                result = run_repair_price(task_id, params, request.include_stale_tickers)
+                result = run_repair_price(task_id, params, request.include_stale_tickers, cancel_event)
             elif request.action == "refresh_fundamentals":
                 update_task(task_id, message="刷新 ROE/GROWTH 基础面字段", progress=0.1)
-                result = {"stats": web_app.refresh_pool_financial_metrics(params), "cache_range": web_app.cache_date_range(web_app.load_price_cache())}
+                t0 = perf_counter()
+                stats = web_app.refresh_pool_financial_metrics(params)
+                stats["timings"] = {"refresh_fundamentals_sec": round(perf_counter() - t0, 3)}
+                result = {"stats": stats, "cache_range": web_app.cache_date_range(web_app.load_price_cache())}
             elif request.action == "rebuild_price":
-                result = run_rebuild(task_id, params)
+                result = run_rebuild(task_id, params, cancel_event)
             else:
                 raise ValueError(f"未知任务类型: {request.action}")
-        update_task(task_id, status="succeeded", progress=1.0, chunk_progress=1.0, message="任务完成", result=result, finished_at=utc_now())
+        result = attach_cache_post_check(result)
+        if cancel_event.is_set():
+            update_task(task_id, status="cancelled", message="任务已取消", result=result, finished_at=utc_now())
+        else:
+            post_check = result.get("post_check") if isinstance(result, dict) else None
+            price_has_gaps = bool(post_check.get("price_has_gaps")) if isinstance(post_check, dict) else False
+            warning = None
+            message = "任务完成"
+            if price_has_gaps and isinstance(post_check, dict):
+                missing_count = int(post_check.get("missing_count") or 0)
+                stale_count = int(post_check.get("stale_count") or 0)
+                message = f"任务完成，复检仍有行情缺口：缺失 {missing_count} 只，落后 {stale_count} 只"
+                warning = message
+            update_task(
+                task_id,
+                status="succeeded",
+                progress=1.0,
+                chunk_progress=1.0,
+                message=message,
+                result=result,
+                warning=warning,
+                finished_at=utc_now(),
+            )
     except Exception as exc:
-        update_task(task_id, status="failed", message="任务失败", error=str(exc), finished_at=utc_now())
+        warning = "任务异常中断，已下载部分若有写入会保留在 price_cache.pkl（周期性落盘）"
+        update_task(task_id, status="failed", message="任务失败", error=str(exc), warning=warning, finished_at=utc_now())
 
 
 def sanitize(value: Any) -> Any:
@@ -662,6 +896,10 @@ def cache_summary() -> dict[str, Any]:
             "pool_count": int(len(pool_cache)) if isinstance(pool_cache, pd.DataFrame) else 0,
             "price_symbol_count": int(price_cache.shape[1]) if isinstance(price_cache, pd.DataFrame) else 0,
             "price_row_count": int(price_cache.shape[0]) if isinstance(price_cache, pd.DataFrame) else 0,
+            "cache_paths": {
+                "price_cache_file": str(web_app.PRICE_CACHE_FILE.resolve()),
+                "pool_cache_file": str(web_app.POOL_CACHE_FILE.resolve()),
+            },
         }
     )
 
@@ -744,6 +982,7 @@ def start_update_task(request: UpdateTaskRequest) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="已有数据更新任务正在执行，请等待完成后再开始新任务")
 
     task_id = str(uuid4())
+    cancel_event = Event()
     with TASKS_LOCK:
         TASKS[task_id] = {
             "id": task_id,
@@ -756,8 +995,9 @@ def start_update_task(request: UpdateTaskRequest) -> dict[str, Any]:
             "updated_at": utc_now(),
             "result": None,
             "error": None,
+            "cancel_event": cancel_event,
         }
-    worker = Thread(target=execute_update_task, args=(task_id, request), daemon=True)
+    worker = Thread(target=execute_update_task, args=(task_id, request, cancel_event), daemon=True)
     worker.start()
     return snapshot_task(task_id)
 
@@ -767,8 +1007,43 @@ def get_task_history(limit: int = 10) -> dict[str, Any]:
     return {"tasks": task_history(limit)}
 
 
+@app.get("/api/tasks/running")
+def get_running_task() -> dict[str, Any]:
+    with TASKS_LOCK:
+        running = next(
+            (
+                task for task in sorted(
+                    TASKS.values(),
+                    key=lambda item: str(item.get("created_at", "")),
+                    reverse=True,
+                )
+                if task.get("status") in {"queued", "running", "cancelling"}
+            ),
+            None,
+        )
+        payload = sanitize(_public_task_fields(running)) if running else None
+    return {"task": payload}
+
+
 @app.get("/api/tasks/{task_id}")
 def get_update_task(task_id: str) -> dict[str, Any]:
+    return snapshot_task(task_id)
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_update_task(task_id: str) -> dict[str, Any]:
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.get("status") not in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail="任务已结束或正在取消中")
+        event = task.get("cancel_event")
+        if isinstance(event, Event):
+            event.set()
+        task["status"] = "cancelling"
+        task["message"] = "正在取消任务，等待当前下载批次结束…"
+        task["updated_at"] = utc_now()
     return snapshot_task(task_id)
 
 
@@ -792,12 +1067,23 @@ def screen(request: ScreenRequest) -> dict[str, Any]:
     filters.update(request.filters or {})
     selected_industries = list(dict.fromkeys(str(item).strip() for item in request.industries if str(item).strip()))
     scoped_pool_cache = pool_cache
-    industry_scope = {"selected": selected_industries, "before_count": int(len(pool_cache)) if isinstance(pool_cache, pd.DataFrame) else 0, "after_count": int(len(pool_cache)) if isinstance(pool_cache, pd.DataFrame) else 0}
+
+    # 主题过滤（基于行业字段关键词匹配，无需 tushare concept API）
+    if request.concept_codes:
+        from .routers.screen import _build_theme_ticker_map  # noqa: PLC0415
+        ticker_map = _build_theme_ticker_map(pool_cache)
+        concept_tickers: set[str] = set()
+        for code in request.concept_codes:
+            concept_tickers |= ticker_map.get(code, set())
+        if concept_tickers:
+            scoped_pool_cache = pool_cache[pool_cache["ticker"].isin(concept_tickers)].copy()
+
+    industry_scope = {"selected": selected_industries, "before_count": int(len(pool_cache)) if isinstance(pool_cache, pd.DataFrame) else 0, "after_count": int(len(scoped_pool_cache)) if isinstance(scoped_pool_cache, pd.DataFrame) else 0}
     if selected_industries:
-        if pool_cache is None or pool_cache.empty or "行业" not in pool_cache.columns:
+        if scoped_pool_cache is None or scoped_pool_cache.empty or "行业" not in scoped_pool_cache.columns:
             raise HTTPException(status_code=400, detail="当前股票池缺少行业字段，无法按板块/行业筛选。请先刷新股票池缓存。")
-        industry_series = pool_cache["行业"].fillna("未分类").astype(str).str.strip().replace("", "未分类")
-        scoped_pool_cache = pool_cache[industry_series.isin(selected_industries)].copy()
+        industry_series = scoped_pool_cache["行业"].fillna("未分类").astype(str).str.strip().replace("", "未分类")
+        scoped_pool_cache = scoped_pool_cache[industry_series.isin(selected_industries)].copy()
         industry_scope["after_count"] = int(len(scoped_pool_cache))
         if scoped_pool_cache.empty:
             raise HTTPException(status_code=400, detail="所选板块/行业内没有可筛选股票，请调整行业范围。")

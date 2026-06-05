@@ -1,0 +1,21 @@
+[Unit]
+Description=MyQuant FastAPI Backend
+After=network.target
+
+[Service]
+Type=simple
+User=myquant
+WorkingDirectory=/app/my_quant
+EnvironmentFile=/app/my_quant/.env
+ExecStart=/app/my_quant/.venv/bin/uvicorn api.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=myquant-backend
+
+[Install]
+WantedBy=multi-user.target

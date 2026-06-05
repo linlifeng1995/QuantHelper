@@ -7,7 +7,7 @@ Next.js + Ant Design frontend for the MyQuant FastAPI service.
 Start the backend from the project root first:
 
 ```powershell
-c:/Tarde/my_quant/.venv/Scripts/python.exe -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+c:/Tarde/my_quant/.venv/Scripts/python.exe -m uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Then start this frontend:
@@ -15,12 +15,15 @@ Then start this frontend:
 ```powershell
 cd c:/Tarde/my_quant/frontend
 npm install
-npm run dev
+npm run dev:lan
 ```
 
 Open:
 
-- http://localhost:3000
+- Local: http://localhost:3000
+- LAN: http://YOUR_LAN_IP:3000
+
+If another device cannot connect, allow inbound TCP ports `3000` and `8000` in Windows Firewall.
 
 ## Current Pages
 

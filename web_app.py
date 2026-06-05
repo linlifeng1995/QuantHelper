@@ -3,21 +3,31 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from http.client import IncompleteRead, RemoteDisconnected
-from datetime import date
+from datetime import date, time as dt_time
 from pathlib import Path
 import random
 import threading
 import time
-from typing import Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import streamlit as st
+try:
+    import streamlit as st
+except ModuleNotFoundError:
+    st = None  # type: ignore[assignment]
 import requests
 import tushare as ts
 import vectorbt as vbt
+from myquant.tushare_client import (
+    DEFAULT_TUSHARE_HTTP_URL,
+    DEFAULT_TUSHARE_TOKEN,
+    init_tushare_pro,
+)
 from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError, ReadTimeout
 from urllib3.exceptions import ProtocolError
+
+from myquant.factors.buckets import normalize_price_discontinuities
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -199,6 +209,10 @@ class AppParams:
     rsi_buy: float
     rsi_sell: float
     download_workers: int
+    ts_min_interval_sec: float = 0.15
+    batch_trade_date_max_days: int = 7
+    batch_ticker_chunk_size: int = 200
+    batch_min_tickers: int = 10
 
 
 class TeaJoinClient:
@@ -307,6 +321,181 @@ def ts_call_with_retry(fn, max_retry: int = 3, wait_sec: int = 3):
     raise RuntimeError(f"Tushare request failed: {last_err}")
 
 
+def set_ts_min_interval_sec(value: float) -> None:
+    global TS_MIN_INTERVAL_SEC
+    try:
+        TS_MIN_INTERVAL_SEC = max(0.0, float(value))
+    except Exception:
+        TS_MIN_INTERVAL_SEC = 1.2
+
+
+def _chunk_list(values: List[str], chunk_size: int) -> List[List[str]]:
+    size = max(1, int(chunk_size))
+    return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def get_open_trade_dates_in_range(pro, start_date_str: str, end_date_str: str) -> List[str]:
+    start_compact = pd.Timestamp(start_date_str).strftime("%Y%m%d")
+    end_compact = pd.Timestamp(end_date_str).strftime("%Y%m%d")
+    try:
+        cal = ts_call_with_retry(
+            lambda: pro.trade_cal(
+                exchange="SSE",
+                start_date=start_compact,
+                end_date=end_compact,
+                fields="cal_date,is_open",
+            ),
+            max_retry=2,
+            wait_sec=2,
+        )
+        if cal is None or cal.empty or ("cal_date" not in cal.columns) or ("is_open" not in cal.columns):
+            return []
+        open_days = cal[cal["is_open"] == 1]["cal_date"].astype(str).tolist()
+        return sorted(open_days)
+    except Exception:
+        return []
+
+
+def fetch_prices_by_trade_date_batches(
+    pro,
+    ticker_start_map: Dict[str, pd.Timestamp],
+    target_end: pd.Timestamp,
+    ticker_chunk_size: int,
+    status_text=None,
+    stage_label: str = "更新",
+    cancel_event=None,
+) -> Tuple[Dict[str, pd.Series], Dict[str, int]]:
+    if not ticker_start_map:
+        return {}, {"batch_requests": 0, "batch_rows": 0, "batch_days": 0, "batch_cancelled": 0}
+
+    min_start = min(ticker_start_map.values())
+    trade_days = get_open_trade_dates_in_range(
+        pro,
+        start_date_str=min_start.strftime("%Y-%m-%d"),
+        end_date_str=target_end.strftime("%Y-%m-%d"),
+    )
+    if not trade_days:
+        return {}, {"batch_requests": 0, "batch_rows": 0, "batch_days": 0, "batch_cancelled": 0}
+
+    ts_code_to_ticker = {to_ts_code(ticker): ticker for ticker in ticker_start_map.keys()}
+    all_ts_codes = list(ts_code_to_ticker.keys())
+    code_chunks = _chunk_list(all_ts_codes, ticker_chunk_size)
+    bucket: Dict[str, List[Tuple[pd.Timestamp, float]]] = {}
+    request_count = 0
+    row_count = 0
+    cancelled = False
+    full_day_hits = 0
+
+    for day in trade_days:
+        day_ts = pd.Timestamp(day)
+        eligible_codes = [code for code, ticker in ts_code_to_ticker.items() if ticker_start_map[ticker] <= day_ts]
+        if not eligible_codes:
+            continue
+
+        def _collect_rows(df_in: pd.DataFrame) -> int:
+            if df_in is None or df_in.empty:
+                return 0
+            use = df_in.copy()
+            if ("ts_code" not in use.columns) or ("trade_date" not in use.columns) or ("close" not in use.columns):
+                return 0
+            use["trade_date"] = pd.to_datetime(use["trade_date"], errors="coerce")
+            use["close"] = pd.to_numeric(use["close"], errors="coerce")
+            use = use.dropna(subset=["trade_date", "close", "ts_code"])
+            if use.empty:
+                return 0
+            use = use[use["ts_code"].astype(str).isin(set(eligible_codes))]
+            if use.empty:
+                return 0
+            use["ticker"] = use["ts_code"].astype(str).map(to_ticker)
+            hit_rows = 0
+            for ticker, grp in use.groupby("ticker"):
+                if ticker not in ticker_start_map:
+                    continue
+                start_ts = ticker_start_map[ticker]
+                grp = grp[pd.to_datetime(grp["trade_date"], errors="coerce") >= start_ts]
+                rows = list(zip(pd.to_datetime(grp["trade_date"]), pd.to_numeric(grp["close"], errors="coerce")))
+                if not rows:
+                    continue
+                bucket.setdefault(ticker, []).extend(rows)
+                hit_rows += len(rows)
+            return int(hit_rows)
+
+        # Preferred path: one full-market request per trade day.
+        day_success = False
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
+        request_count += 1
+        try:
+            day_df = ts_call_with_retry(
+                lambda trade_date=day: pro.daily(
+                    trade_date=trade_date,
+                    fields="ts_code,trade_date,close",
+                ),
+                max_retry=3,
+                wait_sec=2,
+            )
+            hit = _collect_rows(day_df)
+            row_count += hit
+            if hit > 0:
+                day_success = True
+                full_day_hits += 1
+        except Exception:
+            day_success = False
+
+        if not day_success:
+            eligible_set = set(eligible_codes)
+            day_chunks = [chunk for chunk in code_chunks if any(code in eligible_set for code in chunk)]
+            for code_chunk in day_chunks:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
+                request_count += 1
+                try:
+                    df = ts_call_with_retry(
+                        lambda chunk=code_chunk, trade_date=day: pro.daily(
+                            ts_code=",".join(chunk),
+                            trade_date=trade_date,
+                            fields="ts_code,trade_date,close",
+                        ),
+                        max_retry=3,
+                        wait_sec=2,
+                    )
+                except Exception:
+                    continue
+                row_count += _collect_rows(df)
+
+        if cancelled:
+            break
+
+    out: Dict[str, pd.Series] = {}
+    for ticker, rows in bucket.items():
+        if not rows:
+            continue
+        rows_df = pd.DataFrame(rows, columns=["trade_date", "close"]).dropna(subset=["trade_date", "close"])
+        if rows_df.empty:
+            continue
+        rows_df = rows_df.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
+        s = pd.to_numeric(rows_df["close"], errors="coerce")
+        s.index = pd.to_datetime(rows_df["trade_date"])
+        s = s.dropna().rename(ticker)
+        if not s.empty:
+            out[ticker] = s
+
+    if status_text is not None:
+        status_text.markdown(
+            f"**{stage_label}中**：按交易日批量抓取完成，交易日 {len(trade_days)} 天，请求 {request_count} 次，命中 {len(out)} 只"
+        )
+
+    return out, {
+        "batch_requests": int(request_count),
+        "batch_rows": int(row_count),
+        "batch_days": int(len(trade_days)),
+        "batch_full_day_hits": int(full_day_hits),
+        "batch_cancelled": 1 if cancelled else 0,
+    }
+
+
 def financial_period_candidates(end_date_str: str) -> List[str]:
     dt = pd.Timestamp(end_date_str)
     candidates = [
@@ -319,7 +508,7 @@ def financial_period_candidates(end_date_str: str) -> List[str]:
 
 
 def init_tushare_client(token: str, http_url: str):
-    return TeaJoinClient(token=token, http_url=http_url)
+    return init_tushare_pro(token=token, http_url=http_url)
 
 
 def load_price_cache() -> pd.DataFrame:
@@ -374,11 +563,12 @@ def save_pool_cache(pool_df: pd.DataFrame) -> None:
 
 def load_token_cache() -> str:
     if not TOKEN_CACHE_FILE.exists():
-        return ""
+        return DEFAULT_TUSHARE_TOKEN
     try:
-        return TOKEN_CACHE_FILE.read_text(encoding="utf-8").strip()
+        value = TOKEN_CACHE_FILE.read_text(encoding="utf-8").strip()
+        return value or DEFAULT_TUSHARE_TOKEN
     except Exception:
-        return ""
+        return DEFAULT_TUSHARE_TOKEN
 
 
 def save_token_cache(token: str) -> None:
@@ -628,6 +818,42 @@ def get_last_trade_date(pro, end_date_str: str) -> str:
     return end_date_str
 
 
+def _cap_incomplete_cn_trading_day(end_date_str: str, close_time: dt_time = dt_time(15, 30)) -> str:
+    """A 股未收盘前不把今天作为可下载的完整日线日期。"""
+    end_ts = pd.Timestamp(end_date_str)
+    try:
+        now_cn = pd.Timestamp.now(tz="Asia/Shanghai")
+    except Exception:
+        now_cn = pd.Timestamp.now()
+    if end_ts.date() >= now_cn.date() and now_cn.time() < close_time:
+        return (pd.Timestamp(now_cn.date()) - pd.Timedelta(days=1)).strftime("%Y%m%d")
+    return end_ts.strftime("%Y%m%d")
+
+
+def get_latest_available_trade_date(pro, end_date_str: str, lookback_days: int = 10) -> str:
+    end_date_str = _cap_incomplete_cn_trading_day(end_date_str)
+    recent_days = get_recent_open_trade_dates(pro, end_date_str, lookback_days=lookback_days)
+    if not recent_days:
+        return get_last_trade_date(pro, end_date_str)
+
+    for trade_date in recent_days:
+        try:
+            snap = ts_call_with_retry(
+                lambda td=trade_date: pro.daily(
+                    trade_date=td,
+                    fields="ts_code,trade_date,close",
+                ),
+                max_retry=2,
+                wait_sec=2,
+            )
+            if snap is not None and not snap.empty and "ts_code" in snap.columns:
+                return trade_date
+        except Exception:
+            continue
+
+    return recent_days[-1]
+
+
 def get_recent_open_trade_dates(pro, end_date_str: str, lookback_days: int = 60) -> List[str]:
     end_ts = pd.Timestamp(end_date_str)
     start_str = (end_ts - pd.Timedelta(days=max(lookback_days, 10))).strftime("%Y%m%d")
@@ -651,27 +877,17 @@ def get_recent_open_trade_dates(pro, end_date_str: str, lookback_days: int = 60)
 
 
 def fetch_daily_basic_snapshot(pro, trade_date: str, fields: str) -> pd.DataFrame:
-    # First, try recent open days one-by-one to avoid a single-date empty snapshot.
-    candidate_dates: List[str] = []
     if str(trade_date).strip():
-        candidate_dates.append(str(trade_date).strip())
-
-    recent_open_days = get_recent_open_trade_dates(pro, trade_date, lookback_days=60)
-    for d in recent_open_days:
-        if d not in candidate_dates:
-            candidate_dates.append(d)
-
-    for d in candidate_dates[:12]:
         try:
             snap = ts_call_with_retry(
-                lambda: pro.daily_basic(trade_date=d, fields=fields),
+                lambda: pro.daily_basic(trade_date=str(trade_date).strip(), fields=fields),
                 max_retry=3,
                 wait_sec=2,
             )
             if snap is not None and not snap.empty:
                 return snap
         except Exception:
-            continue
+            pass
 
     # Fallback: pull a short date range and take the latest row per ts_code.
     end_ts = pd.Timestamp(trade_date)
@@ -752,7 +968,7 @@ def fetch_financial_snapshot_for_codes(
 
 def fetch_stock_pool(pro, params: AppParams) -> pd.DataFrame:
     end_str = pd.Timestamp(params.end_date).strftime("%Y%m%d")
-    trade_date = get_last_trade_date(pro, end_str)
+    trade_date = get_latest_available_trade_date(pro, end_str)
 
     basic = ts_call_with_retry(
         lambda: pro.stock_basic(exchange="", list_status="L", fields="ts_code,symbol,name,industry,list_date")
@@ -977,7 +1193,7 @@ def calculate_price_factors(price_cache_df: pd.DataFrame, tickers: List[str], en
     if not available or px.empty:
         return out
 
-    px = px[available].ffill()
+    px = normalize_price_discontinuities(px[available]).ffill()
     last = px.iloc[-1]
     factor_map: Dict[str, pd.Series] = {}
     for window in [20, 60, 120]:
@@ -993,8 +1209,8 @@ def calculate_price_factors(price_cache_df: pd.DataFrame, tickers: List[str], en
     factor_map["momentum_accel"] = factor_map.get("ret_120d", pd.Series(np.nan, index=available)) - factor_map.get("ret_20d", pd.Series(np.nan, index=available))
     factor_map["vol_60d"] = px.pct_change().tail(60).std() * np.sqrt(252)
     factor_map["vol_120d"] = px.pct_change().tail(120).std() * np.sqrt(252)
-    rolling_max = px.cummax()
-    factor_map["max_drawdown_120d"] = (px.tail(120) / rolling_max.tail(120) - 1.0).min()
+    dd_window = px.tail(120)
+    factor_map["max_drawdown_120d"] = (dd_window / dd_window.cummax() - 1.0).min()
 
     factor_df = pd.DataFrame(factor_map).reset_index().rename(columns={"index": "ticker"})
     return out.merge(factor_df, on="ticker", how="left")
@@ -1235,14 +1451,11 @@ def _download_price_chunk(
         status_text.markdown(f"**分段下载**：{chunk_note} {start_str} ~ {end_str}")
 
     # Use daily endpoint only to minimize request count and avoid extra adj_factor calls.
-    try:
-        hist = ts_call_with_retry(
-            lambda: pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str, fields="trade_date,close"),
-            max_retry=3,
-            wait_sec=2,
-        )
-    except Exception:
-        hist = pd.DataFrame()
+    hist = ts_call_with_retry(
+        lambda: pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str, fields="trade_date,close"),
+        max_retry=3,
+        wait_sec=2,
+    )
 
     if hist is None or hist.empty or "trade_date" not in hist.columns or "close" not in hist.columns:
         return pd.DataFrame()
@@ -1348,6 +1561,14 @@ def update_price_cache_incremental(
     status_text=None,
     stage_label: str = "更新",
     workers: int = 4,
+    save_callback=None,
+    save_every: int = 50,
+    cancel_event=None,
+    progress_stats_callback: Callable[[dict[str, int]], Any] | None = None,
+    ts_min_interval_sec: float = 1.2,
+    batch_trade_date_max_days: int = 2,
+    batch_ticker_chunk_size: int = 200,
+    batch_min_tickers: int = 40,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     if cache_df is None or not isinstance(cache_df, pd.DataFrame):
         cache_df = pd.DataFrame()
@@ -1358,6 +1579,7 @@ def update_price_cache_incremental(
 
     target_end = pd.Timestamp(target_end_date)
     workers = max(1, int(workers))
+    set_ts_min_interval_sec(ts_min_interval_sec)
 
     plans: List[Tuple[str, pd.Timestamp]] = []
     for ticker in tickers:
@@ -1368,22 +1590,65 @@ def update_price_cache_incremental(
                 fetch_start = valid_idx.max() + pd.Timedelta(days=1)
         if fetch_start <= target_end:
             plans.append((ticker, fetch_start))
+    already_current_count = max(0, len(tickers) - len(plans))
+
+    # For near-real-time updates, prefer trade-date batched pulls.
+    short_plans: List[Tuple[str, pd.Timestamp]] = []
+    long_plans: List[Tuple[str, pd.Timestamp]] = []
+    max_days = max(1, int(batch_trade_date_max_days))
+    for ticker, fetch_start in plans:
+        span_days = int((target_end - fetch_start).days) + 1
+        if span_days <= max_days:
+            short_plans.append((ticker, fetch_start))
+        else:
+            long_plans.append((ticker, fetch_start))
+
+    use_batch_mode = len(short_plans) >= max(1, int(batch_min_tickers))
 
     total_tickers = len(plans)
     fetched_ticker_count = 0
     appended_rows = 0
+    failed_ticker_count = 0
+    skipped_ticker_count = 0
 
     if total_tickers == 0:
         return cache_df, {
             "tickers_requested": len(tickers),
+            "total_tickers": 0,
+            "processed_tickers": 0,
             "tickers_updated": 0,
+            "tickers_failed": 0,
+            "tickers_skipped": 0,
             "rows_appended": 0,
+            "tickers_already_current": int(already_current_count),
         }
 
     if progress_bar is not None:
         progress_bar.progress(0.0)
     if chunk_progress_bar is not None:
         chunk_progress_bar.progress(0.0)
+    if progress_stats_callback is not None:
+        progress_stats_callback(
+            {
+                "total_tickers": int(total_tickers),
+                "processed_tickers": 0,
+                "tickers_updated": 0,
+                "tickers_skipped": 0,
+                "tickers_failed": 0,
+            }
+        )
+
+    def _merge_ticker_series(target_df: pd.DataFrame, ticker: str, px: pd.Series) -> pd.DataFrame:
+        if target_df.empty:
+            return px.to_frame()
+        if ticker in target_df.columns:
+            base = target_df[ticker]
+            incoming = px.reindex(target_df.index.union(px.index))
+            base = base.reindex(incoming.index)
+            target_df = target_df.reindex(incoming.index)
+            target_df[ticker] = incoming.combine_first(base)
+            return target_df
+        return target_df.join(px, how="outer")
 
     def _fetch_one(plan: Tuple[str, pd.Timestamp]) -> Tuple[str, pd.Series | None]:
         ticker, fetch_start_ts = plan
@@ -1396,44 +1661,125 @@ def update_price_cache_incremental(
         return ticker, series
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=min(workers, total_tickers)) as executor:
-        future_map = {executor.submit(_fetch_one, plan): plan[0] for plan in plans}
-        for future in as_completed(future_map):
+    cancelled = False
+    recent_tickers: list[str] = []
+
+    def _recent_suffix() -> str:
+        if not recent_tickers:
+            return ""
+        return f"，最近：{', '.join(recent_tickers[-3:])}"
+
+    batch_stats: Dict[str, int] = {"batch_requests": 0, "batch_rows": 0, "batch_days": 0, "batch_cancelled": 0}
+    if use_batch_mode and short_plans:
+        ticker_start_map = {ticker: start for ticker, start in short_plans}
+        batched_series, batch_stats = fetch_prices_by_trade_date_batches(
+            pro=pro,
+            ticker_start_map=ticker_start_map,
+            target_end=target_end,
+            ticker_chunk_size=max(20, int(batch_ticker_chunk_size)),
+            status_text=status_text,
+            stage_label=stage_label,
+            cancel_event=cancel_event,
+        )
+        for ticker, _ in short_plans:
             completed += 1
-            ticker = future_map[future]
-            try:
-                ticker, px = future.result()
-            except Exception as exc:  # noqa: BLE001
-                px = None
-                if status_text is not None:
-                    status_text.markdown(f"**{stage_label}中**：{completed}/{total_tickers} 只，{ticker} 下载失败：{exc}")
-
-            if px is not None and (not px.empty):
+            px = batched_series.get(ticker)
+            if px is not None and not px.empty:
                 fetched_ticker_count += 1
-                appended_rows += len(px)
-
-                if cache_df.empty:
-                    cache_df = px.to_frame()
-                else:
-                    if ticker in cache_df.columns:
-                        base = cache_df[ticker]
-                        incoming = px.reindex(cache_df.index.union(px.index))
-                        base = base.reindex(incoming.index)
-                        cache_df = cache_df.reindex(incoming.index)
-                        cache_df[ticker] = incoming.combine_first(base)
-                    else:
-                        cache_df = cache_df.join(px, how="outer")
-
-                if status_text is not None:
-                    status_text.markdown(f"**{stage_label}中**：{completed}/{total_tickers} 只，已完成 {ticker}")
+                appended_rows += int(len(px))
+                cache_df = _merge_ticker_series(cache_df, ticker, px)
             else:
-                if status_text is not None:
-                    status_text.markdown(f"**{stage_label}中**：{completed}/{total_tickers} 只，{ticker} 无可用数据，跳过")
+                skipped_ticker_count += 1
+
+            recent_tickers.append(ticker)
+            if len(recent_tickers) > 6:
+                recent_tickers.pop(0)
 
             if progress_bar is not None:
                 progress_bar.progress(completed / total_tickers)
             if chunk_progress_bar is not None:
                 chunk_progress_bar.progress(completed / total_tickers)
+            if progress_stats_callback is not None:
+                progress_stats_callback(
+                    {
+                        "total_tickers": int(total_tickers),
+                        "processed_tickers": int(completed),
+                        "tickers_updated": int(fetched_ticker_count),
+                        "tickers_skipped": int(skipped_ticker_count),
+                        "tickers_failed": int(failed_ticker_count),
+                    }
+                )
+
+    remaining_plans = long_plans if use_batch_mode else plans
+
+    if remaining_plans:
+        with ThreadPoolExecutor(max_workers=min(workers, len(remaining_plans))) as executor:
+            future_map = {executor.submit(_fetch_one, plan): plan[0] for plan in remaining_plans}
+            for future in as_completed(future_map):
+                completed += 1
+                ticker = future_map[future]
+                had_error = False
+                try:
+                    ticker, px = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    px = None
+                    had_error = True
+                    if status_text is not None:
+                        status_text.markdown(f"**{stage_label}中**：{completed}/{total_tickers} 只，{ticker} 下载失败：{exc}{_recent_suffix()}")
+
+                if px is not None and (not px.empty):
+                    fetched_ticker_count += 1
+                    appended_rows += len(px)
+                    cache_df = _merge_ticker_series(cache_df, ticker, px)
+
+                    if status_text is not None:
+                        status_text.markdown(f"**{stage_label}中**：{completed}/{total_tickers} 只，已完成 {ticker}{_recent_suffix()}")
+                else:
+                    if had_error:
+                        failed_ticker_count += 1
+                    else:
+                        skipped_ticker_count += 1
+                    if status_text is not None:
+                        status_text.markdown(f"**{stage_label}中**：{completed}/{total_tickers} 只，{ticker} 无可用数据，跳过{_recent_suffix()}")
+
+                recent_tickers.append(ticker)
+                if len(recent_tickers) > 6:
+                    recent_tickers.pop(0)
+
+                if progress_bar is not None:
+                    progress_bar.progress(completed / total_tickers)
+                if chunk_progress_bar is not None:
+                    chunk_progress_bar.progress(completed / total_tickers)
+                if progress_stats_callback is not None:
+                    progress_stats_callback(
+                        {
+                            "total_tickers": int(total_tickers),
+                            "processed_tickers": int(completed),
+                            "tickers_updated": int(fetched_ticker_count),
+                            "tickers_skipped": int(skipped_ticker_count),
+                            "tickers_failed": int(failed_ticker_count),
+                        }
+                    )
+
+                if save_callback is not None and save_every > 0 and completed % save_every == 0:
+                    try:
+                        save_callback(cache_df)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    for pending in future_map:
+                        if not pending.done():
+                            pending.cancel()
+                    if save_callback is not None:
+                        try:
+                            save_callback(cache_df)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if status_text is not None:
+                        status_text.markdown(f"{stage_label}已取消：完成 {completed}/{total_tickers} 只后中止")
+                    break
 
     if not cache_df.empty:
         cache_df = cache_df.sort_index()
@@ -1441,8 +1787,20 @@ def update_price_cache_incremental(
 
     stats = {
         "tickers_requested": len(tickers),
+        "total_tickers": int(total_tickers),
+        "processed_tickers": int(completed),
         "tickers_updated": fetched_ticker_count,
+        "tickers_failed": int(failed_ticker_count),
+        "tickers_skipped": int(skipped_ticker_count),
         "rows_appended": appended_rows,
+        "tickers_already_current": int(already_current_count),
+        "cancelled": 1 if cancelled else 0,
+        "batch_mode_used": 1 if use_batch_mode else 0,
+        "batch_tickers": int(len(short_plans) if use_batch_mode else 0),
+        "batch_trade_date_max_days": int(max_days),
+        "batch_ticker_chunk_size": int(batch_ticker_chunk_size),
+        "ts_min_interval_sec": float(ts_min_interval_sec),
+        **batch_stats,
     }
     return cache_df, stats
 
@@ -1692,8 +2050,8 @@ def make_download_bytes(df: pd.DataFrame) -> bytes:
 
 def build_params() -> AppParams:
     st.sidebar.header("参数设置")
-    token = st.sidebar.text_input("Tushare Token", value="", type="password")
-    http_url = st.sidebar.text_input("HTTP URL", value="http://teajoin.com")
+    token = st.sidebar.text_input("Tushare Token", value=load_token_cache() or DEFAULT_TUSHARE_TOKEN, type="password")
+    http_url = st.sidebar.text_input("HTTP URL", value=DEFAULT_TUSHARE_HTTP_URL)
 
     default_start = date(2025, 6, 1)
     default_end = date(2025, 12, 1)
@@ -1888,9 +2246,12 @@ def update_cache_to_today(params: AppParams) -> Tuple[Dict[str, int], Tuple[str,
 
     pro = init_tushare_client(params.token, params.http_url)
     today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
-    pool_params = AppParams(**{**params.__dict__, "end_date": today_str})
-    pool_df = fetch_stock_pool(pro, pool_params)
-    save_pool_cache(pool_df)
+    effective_end_date = get_latest_available_trade_date(pro, pd.Timestamp(today_str).strftime("%Y%m%d"))
+    pool_params = AppParams(**{**params.__dict__, "end_date": effective_end_date})
+    pool_df = load_pool_cache()
+    if pool_df.empty:
+        pool_df = fetch_stock_pool(pro, pool_params)
+        save_pool_cache(pool_df)
     tickers = pool_df["ticker"].astype(str).tolist()
 
     cache_df = load_price_cache()
@@ -1899,7 +2260,7 @@ def update_cache_to_today(params: AppParams) -> Tuple[Dict[str, int], Tuple[str,
         tickers=tickers,
         cache_df=cache_df,
         initial_start_date=params.start_date,
-        target_end_date=today_str,
+        target_end_date=effective_end_date,
         progress_bar=st.session_state.get("update_progress_bar"),
         chunk_progress_bar=st.session_state.get("update_chunk_progress_bar"),
         status_text=st.session_state.get("update_status_text"),
@@ -1918,7 +2279,8 @@ def rebuild_cache_to_today(params: AppParams) -> Tuple[Dict[str, int], Tuple[str
 
     pro = init_tushare_client(params.token, params.http_url)
     today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
-    pool_params = AppParams(**{**params.__dict__, "end_date": today_str})
+    effective_end_date = get_latest_available_trade_date(pro, pd.Timestamp(today_str).strftime("%Y%m%d"))
+    pool_params = AppParams(**{**params.__dict__, "end_date": effective_end_date})
     pool_df = fetch_stock_pool(pro, pool_params)
     save_pool_cache(pool_df)
     tickers = pool_df["ticker"].astype(str).tolist()
@@ -1929,7 +2291,7 @@ def rebuild_cache_to_today(params: AppParams) -> Tuple[Dict[str, int], Tuple[str
         tickers=tickers,
         cache_df=cache_df,
         initial_start_date=params.start_date,
-        target_end_date=today_str,
+        target_end_date=effective_end_date,
         progress_bar=st.session_state.get("update_progress_bar"),
         chunk_progress_bar=st.session_state.get("update_chunk_progress_bar"),
         status_text=st.session_state.get("update_status_text"),
@@ -1951,10 +2313,11 @@ def supplement_missing_cache_to_today(
 
     pro = init_tushare_client(params.token, params.http_url)
     today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+    effective_end_date = get_latest_available_trade_date(pro, pd.Timestamp(today_str).strftime("%Y%m%d"))
 
     pool_df = load_pool_cache()
     if pool_df.empty:
-        pool_params = AppParams(**{**params.__dict__, "end_date": today_str})
+        pool_params = AppParams(**{**params.__dict__, "end_date": effective_end_date})
         pool_df = fetch_stock_pool(pro, pool_params)
         save_pool_cache(pool_df)
 
@@ -1980,7 +2343,7 @@ def supplement_missing_cache_to_today(
         tickers=repair_tickers,
         cache_df=cache_df,
         initial_start_date=params.start_date,
-        target_end_date=today_str,
+        target_end_date=effective_end_date,
         progress_bar=st.session_state.get("update_progress_bar"),
         chunk_progress_bar=st.session_state.get("update_chunk_progress_bar"),
         status_text=st.session_state.get("update_status_text"),
@@ -2086,7 +2449,7 @@ def main() -> None:
         default_token = st.session_state.get("update_token", "") or load_token_cache() or ""
         cfg1, cfg2 = st.columns(2)
         token = cfg1.text_input("Tushare Token", value=default_token, type="password", key="update_token")
-        http_url = cfg2.text_input("HTTP URL", value="http://teajoin.com", key="update_http")
+        http_url = cfg2.text_input("HTTP URL", value=DEFAULT_TUSHARE_HTTP_URL, key="update_http")
 
         cfg3, cfg4 = st.columns(2)
         start_date_cfg = cfg3.date_input("价格缓存起始日期", value=date(2025, 6, 1), key="update_start")

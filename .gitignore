@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 .Python
 .venv/
+.venv312/
 venv/
 env/
 *.egg-info/
@@ -19,6 +20,11 @@ env/
 .env
 .env.*
 outputs/cache/tushare_token.txt
+outputs/cache/*.err
+outputs/cache/*.db
+outputs/cache/*.db-shm
+outputs/cache/*.db-wal
+outputs/cache/ohlcv/
 
 # Frontend
 frontend/node_modules/
@@ -36,6 +42,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+scripts/.dev-pids.json
 
 # OS and editor
 .DS_Store

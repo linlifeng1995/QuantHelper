@@ -2,6 +2,40 @@
 
 ## 启动方式：Next.js + Ant Design + FastAPI
 
+### 一键启动（推荐）
+
+如果已经安装 `myquant-lan-service` Codex skill，可以直接运行一键启动脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\64469\.codex\skills\myquant-lan-service\scripts\start-myquant-lan.ps1
+```
+
+脚本会同时启动 FastAPI 后端和 Next.js 前端，并输出本机地址、局域网地址和日志目录。
+
+关闭服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File c:\Tarde\my_quant\scripts\stop-lan.ps1
+```
+
+关闭脚本会停止监听 `3000` 和 `8000` 端口的进程。
+
+快速重启：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File c:\Tarde\my_quant\scripts\stop-lan.ps1
+powershell -ExecutionPolicy Bypass -File C:\Users\64469\.codex\skills\myquant-lan-service\scripts\start-myquant-lan.ps1
+```
+
+如果一键启动提示 `Frontend already listening on 3000`，但浏览器页面打不开或返回 404，通常是旧前端进程占着端口。先运行关闭脚本，再重新启动。日志位置：
+
+- `outputs/logs/frontend-lan.out.log`
+- `outputs/logs/frontend-lan.err.log`
+- `outputs/logs/backend-lan.out.log`
+- `outputs/logs/backend-lan.err.log`
+
+### 手动启动
+
 安装或更新后端依赖：
 
 ```powershell
@@ -11,7 +45,7 @@ c:/Tarde/my_quant/.venv/Scripts/python.exe -m pip install -r c:/Tarde/my_quant/r
 启动 FastAPI 后端服务：
 
 ```powershell
-c:/Tarde/my_quant/.venv/Scripts/python.exe -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+c:/Tarde/my_quant/.venv/Scripts/python.exe -m uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 启动 Next.js 前端服务：
@@ -19,25 +53,28 @@ c:/Tarde/my_quant/.venv/Scripts/python.exe -m uvicorn api.main:app --reload --ho
 ```powershell
 cd c:/Tarde/my_quant/frontend
 npm install
-npm run dev
+npm run dev:lan
 ```
 
 浏览器打开：
 
-- http://localhost:3000
-- API 文档：http://localhost:8000/docs
+- 本机：http://localhost:3000
+- 同一局域网其他设备：http://本机局域网IP:3000
+- API 文档：http://本机局域网IP:8000/docs
 
 如果 `3000` 端口已被占用，Next.js 会自动尝试使用其他端口，例如 `http://localhost:3001`。终端输出中的 `Local` 地址就是实际可访问地址。
+如果其他设备仍无法访问，请确认 Windows 防火墙允许入站 TCP 端口 `3000` 和 `8000`，并确认访问设备与本机在同一局域网。
 
 ## 旧版 Streamlit 启动方式
 
 ```powershell
-c:/Tarde/my_quant/.venv/Scripts/python.exe -m streamlit run c:/Tarde/my_quant/web_app.py --server.headless true --server.port 8501
+c:/Tarde/my_quant/.venv/Scripts/python.exe -m streamlit run c:/Tarde/my_quant/web_app.py --server.headless true --server.address 0.0.0.0 --server.port 8501
 ```
 
 浏览器打开：
 
-- http://localhost:8501
+- 本机：http://localhost:8501
+- 同一局域网其他设备：http://本机局域网IP:8501
 
 Streamlit 版本仍保留为旧版原型，React 前端迁移期间可以作为对照使用。
 
@@ -116,6 +153,44 @@ Streamlit 版本仍保留为旧版原型，React 前端迁移期间可以作为�
 观察池文件：
 
 - outputs/cache/watchlist.json
+
+## Agent 助手
+
+前端支持两类入口：
+
+- 全局入口：页头右上角“AI 助手”。
+- 功能内入口：
+  - 筛选结果表每行“Agent诊断”
+  - 观察池表每行“Agent诊断”
+  - 股票详情抽屉“Agent 诊断”
+  - 回测页“复盘本次回测”
+  - 推荐关注卡片“Agent解读”
+
+聊天体验：
+
+- 支持多会话（新建会话、切换会话、会话本地保存）。
+- 支持 Enter 发送，Shift+Enter 换行。
+- 支持打字机式显示回复，并可“停止生成”。
+
+后端接口：
+
+- 健康检查：`GET /api/agent/health`
+- 调用入口：`POST /api/agent/invoke`
+
+配置方式：
+
+- 推荐在后端配置（环境变量）：
+  - `AGENT_DEFAULT_PROVIDER`（可选：`kimi` / `deepseek`，默认 `kimi`）
+  - Kimi：
+    - `KIMI_API_KEY`
+    - `KIMI_BASE_URL`（默认 `https://api.moonshot.cn/v1`）
+    - `KIMI_MODEL`（默认 `moonshot-v1-8k`）
+  - DeepSeek：
+    - `DEEPSEEK_API_KEY`
+    - `DEEPSEEK_BASE_URL`（默认 `https://api.deepseek.com`）
+    - `DEEPSEEK_MODEL`（默认 `deepseek-v4-flash`）
+- 可选口令：`AGENT_ACCESS_TOKEN`。配置后前端需要输入访问口令。
+- 前端“会话栏”支持在 `Kimi` 与 `DeepSeek` 间切换；“高级设置”支持临时覆盖 key/base_url/model（仅保存在浏览器本地）。
 
 ## 筛选择股
 

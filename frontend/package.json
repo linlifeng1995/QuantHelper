@@ -4,13 +4,17 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:lan": "next dev --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start",
+    "start:lan": "next start --hostname 0.0.0.0",
     "lint": "eslint"
   },
   "dependencies": {
     "@ant-design/icons": "^6.2.3",
     "antd": "^6.4.3",
+    "echarts": "^6.1.0",
+    "echarts-for-react": "^3.0.6",
     "next": "16.2.6",
     "react": "19.2.4",
     "react-dom": "19.2.4"
